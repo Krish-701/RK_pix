@@ -24,8 +24,11 @@ git clone https://github.com/username/comfyui-rk-pix RK_pix
 | **Mirror Image (RK)** | Flip image horizontally, vertically, or both |
 | **Crop Image (RK)** | Crop image using percentage-based coordinates |
 | **Add Border (RK)** | Add a colored border around an image |
+<<<<<<< HEAD
 | **Advanced Image Loader (RK)** | Universal image loader with batch, frame-by-frame playback, and EXR support |
 | **EXR Converter (RK)** | Dedicated EXR processor with color space conversion, tone mapping, and LUT support |
+=======
+>>>>>>> 97a1e8ce5557a2948ba670876b731edcbce13c22
 
 ### Utility (`rk_pix/utility`)
 
@@ -67,6 +70,7 @@ Chain multiple Color Adjust nodes for fine-tuned image correction.
 ### Glitch Effect
 Use with a seed for reproducible glitch patterns.
 
+<<<<<<< HEAD
 ### Advanced Image Loader
 **Modes:**
 - `single` — Load one image
@@ -90,6 +94,8 @@ Convert EXR files with professional color management:
 - **Auto-save:** Save converted PNG to ComfyUI output folder
 - **LUT support:** Place `.cube` files in `input/luts/` folder
 
+=======
+>>>>>>> 97a1e8ce5557a2948ba670876b731edcbce13c22
 ## License
 
 MIT License
