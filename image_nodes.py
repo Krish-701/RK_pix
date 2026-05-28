@@ -325,7 +325,7 @@ class RKAdvancedImageLoader:
         
         return {
             "required": {
-                "image": (sorted(all_files), {"tooltip": "Select an image file. For batch mode, select any file in the folder as reference."}),
+                "image": (sorted(all_files), {"tooltip": "Select an image file from ComfyUI input folder. For custom path mode, this is ignored."}),
                 "enable": ("BOOLEAN", {"default": True, "tooltip": "Enable/disable this node"}),
                 "mode": (["single", "batch_folder", "batch_pattern", "frame_by_frame"], {"default": "single", "tooltip": "single=load one image, batch_folder=load all images in same folder, batch_pattern=load matching pattern, frame_by_frame=play one frame per run"}),
                 "start_frame": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1, "tooltip": "Starting frame index (0=first)"}),
@@ -337,6 +337,7 @@ class RKAdvancedImageLoader:
             "optional": {
                 "pattern": ("STRING", {"default": "*.png", "tooltip": "Glob pattern for batch_pattern mode (e.g., *.png, frame_*.jpg, render_*.exr)"}),
                 "sort_by": (["name", "name_natural", "modified_time", "size"], {"default": "name_natural", "tooltip": "How to sort batch files"}),
+                "custom_folder": ("STRING", {"default": "", "tooltip": "FULL custom folder path (e.g., /home/user/images or D:\\Renders\\Seq). When set, ignores the 'image' dropdown and loads from this path directly."}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -349,7 +350,7 @@ class RKAdvancedImageLoader:
     FUNCTION = "load_image"
 
     def load_image(self, image, enable, mode, start_frame, end_frame, step, loop, reset,
-                   pattern="*.png", sort_by="name_natural", unique_id=None):
+                   pattern="*.png", sort_by="name_natural", custom_folder="", unique_id=None):
         
         if not enable:
             # Return a single black pixel image when disabled
@@ -357,18 +358,49 @@ class RKAdvancedImageLoader:
             mask = torch.zeros((1, 64, 64))
             return (dummy, mask, 0, 0, "[DISABLED] Node is off", "")
 
-        input_dir = folder_paths.get_input_directory()
-        selected_path = os.path.join(input_dir, image)
+        # Determine the base folder path
+        if custom_folder and custom_folder.strip():
+            # Use custom folder path
+            folder = os.path.normpath(custom_folder.strip())
+            if not os.path.exists(folder):
+                raise Exception(f"[RKAdvancedImageLoader] Custom folder not found: {folder}")
+            if not os.path.isdir(folder):
+                raise Exception(f"[RKAdvancedImageLoader] Custom path is not a folder: {folder}")
+            # For single mode with custom folder, try to use the 'image' as a filename in that folder
+            input_dir = folder
+            selected_path = os.path.join(folder, image) if image else ""
+        else:
+            # Use ComfyUI input directory
+            input_dir = folder_paths.get_input_directory()
+            selected_path = os.path.join(input_dir, image)
+            folder = input_dir
         
-        if not os.path.exists(selected_path):
+        if selected_path and not os.path.exists(selected_path) and mode == "single":
             raise Exception(f"[RKAdvancedImageLoader] File not found: {selected_path}")
 
         # Determine file list based on mode
         if mode == "single":
-            file_list = [selected_path]
+            if selected_path and os.path.exists(selected_path):
+                file_list = [selected_path]
+            else:
+                # Try to find first image in the folder
+                all_exts = [
+                    '*.png', '*.jpg', '*.jpeg', '*.webp', '*.bmp', '*.tiff', '*.tif',
+                    '*.tga', '*.dds', '*.exr', '*.hdr', '*.pic', '*.pnm', '*.ppm',
+                    '*.pgm', '*.pbm', '*.pfm', '*.sgi', '*.ras', '*.sun', '*.ico',
+                    '*.psd', '*.xpm', '*.xbm'
+                ]
+                temp_list = []
+                for ext in all_exts:
+                    temp_list.extend(glob.glob(os.path.join(folder, ext)))
+                    temp_list.extend(glob.glob(os.path.join(folder, ext.upper())))
+                temp_list = sorted(list(set(temp_list)))
+                if temp_list:
+                    file_list = [temp_list[0]]
+                else:
+                    raise Exception(f"[RKAdvancedImageLoader] No images found in folder: {folder}")
         elif mode == "batch_folder":
-            folder = os.path.dirname(selected_path)
-            # Get all supported image files in the same folder
+            # Get all supported image files in the folder
             all_exts = [
                 '*.png', '*.jpg', '*.jpeg', '*.webp', '*.bmp', '*.tiff', '*.tif',
                 '*.tga', '*.dds', '*.exr', '*.hdr', '*.pic', '*.pnm', '*.ppm',
@@ -382,7 +414,6 @@ class RKAdvancedImageLoader:
             # Remove duplicates and sort
             file_list = sorted(list(set(file_list)))
         elif mode in ("batch_pattern", "frame_by_frame"):
-            folder = os.path.dirname(selected_path)
             if os.path.isabs(pattern):
                 search_path = pattern
             else:
@@ -390,7 +421,7 @@ class RKAdvancedImageLoader:
             file_list = glob.glob(search_path)
             file_list = sorted(list(set(file_list)))
         else:
-            file_list = [selected_path]
+            file_list = [selected_path] if selected_path else []
 
         if not file_list:
             raise Exception(f"[RKAdvancedImageLoader] No files found for mode '{mode}' with pattern '{pattern}'")
@@ -678,9 +709,22 @@ class RKAdvancedImageLoader:
 
     @classmethod
     def IS_CHANGED(cls, image, enable, mode, start_frame, end_frame, step, loop, reset,
-                   pattern="*.png", sort_by="name_natural", unique_id=None):
+                   pattern="*.png", sort_by="name_natural", custom_folder="", unique_id=None):
         if not enable or mode != "frame_by_frame":
             # For batch/single modes, check if files changed
+            if custom_folder and custom_folder.strip():
+                folder = os.path.normpath(custom_folder.strip())
+                if os.path.exists(folder) and os.path.isdir(folder):
+                    # Hash the folder contents for change detection
+                    all_files = []
+                    for f in sorted(os.listdir(folder)):
+                        fpath = os.path.join(folder, f)
+                        if os.path.isfile(fpath):
+                            all_files.append(fpath)
+                    m = hashlib.sha256()
+                    for fpath in sorted(all_files)[:50]:  # Limit to first 50 files
+                        m.update(os.path.basename(fpath).encode())
+                    return m.digest().hex()
             input_dir = folder_paths.get_input_directory()
             filepath = os.path.join(input_dir, image)
             if os.path.exists(filepath):
