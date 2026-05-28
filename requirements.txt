@@ -1,0 +1,38 @@
+# RK Pix - ComfyUI Custom Nodes
+# Install all dependencies for full feature support
+# Run: pip install -r requirements.txt
+
+# ============================================
+# CORE DEPENDENCIES (Required)
+# ============================================
+# These are usually pre-installed in ComfyUI,
+# but listed here for completeness
+numpy>=1.21.0
+pillow>=9.0.0
+torch>=2.0.0
+
+# ============================================
+# VIDEO PROCESSING (Required for Video Nodes)
+# ============================================
+# Video Loader, Video Saver, Video Frame Player
+opencv-python>=4.8.0
+
+# ============================================
+# EXR IMAGE SUPPORT (Required for EXR Nodes)
+# ============================================
+# Advanced Image Loader + EXR Converter
+# Full EXR channel support, float precision, HDR
+OpenEXR>=1.3.9
+
+# ============================================
+# EXTENDED IMAGE FORMATS (Recommended)
+# ============================================
+# RAW camera files: CR2, NEF, ARW, DNG, etc.
+rawpy>=0.18.0
+
+# Advanced TIFF/GeoTIFF/multi-page TIFF support
+tifffile>=2023.0.0
+
+# Unified image I/O for additional formats
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.9

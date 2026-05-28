@@ -1,0 +1,20 @@
+[project]
+name = "rk-pix"
+version = "1.0.0"
+license = {text = "MIT"}
+description = "A collection of custom nodes for image processing, utilities, and creative effects for ComfyUI"
+repository = "https://github.com/username/comfyui-rk-pix"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.21.0",
+    "pillow>=9.0.0",
+    "torch>=2.0.0",
+]
+
+[project.urls]
+Repository = "https://github.com/username/comfyui-rk-pix"
+
+[tool.comfy]
+PublisherId = "your-github-username"
+DisplayName = "RK Pix"
+Icon = ""
