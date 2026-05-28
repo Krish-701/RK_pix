@@ -2,7 +2,6 @@ import torch
 import numpy as np
 from PIL import Image, ImageFilter, ImageEnhance
 import comfy.utils
-<<<<<<< HEAD
 import os
 import folder_paths
 import glob
@@ -22,8 +21,6 @@ try:
     OPENEXR_AVAILABLE = True
 except ImportError:
     OPENEXR_AVAILABLE = False
-=======
->>>>>>> 97a1e8ce5557a2948ba670876b731edcbce13c22
 
 # ============================================================
 # IMAGE PROCESSING NODES
@@ -290,7 +287,6 @@ class RKImageBorder:
 
 
 # ============================================================
-<<<<<<< HEAD
 # RK ADVANCED IMAGE LOADER - Universal batch/frame-by-frame loader
 # ============================================================
 
@@ -1038,8 +1034,6 @@ class RK_EXRConverter:
 
 
 # ============================================================
-=======
->>>>>>> 97a1e8ce5557a2948ba670876b731edcbce13c22
 # REGISTRATION
 # ============================================================
 
@@ -1050,11 +1044,8 @@ IMAGE_CLASS_MAPPINGS = {
     "RKImageMirror": RKImageMirror,
     "RKImageCrop": RKImageCrop,
     "RKImageBorder": RKImageBorder,
-<<<<<<< HEAD
     "RKAdvancedImageLoader": RKAdvancedImageLoader,
     "RK_EXRConverter": RK_EXRConverter,
-=======
->>>>>>> 97a1e8ce5557a2948ba670876b731edcbce13c22
 }
 
 IMAGE_NAME_MAPPINGS = {
@@ -1064,9 +1055,6 @@ IMAGE_NAME_MAPPINGS = {
     "RKImageMirror": "Mirror Image (RK)",
     "RKImageCrop": "Crop Image (RK)",
     "RKImageBorder": "Add Border (RK)",
-<<<<<<< HEAD
     "RKAdvancedImageLoader": "Advanced Image Loader (RK)",
     "RK_EXRConverter": "EXR Converter (RK)",
-=======
->>>>>>> 97a1e8ce5557a2948ba670876b731edcbce13c22
 }
