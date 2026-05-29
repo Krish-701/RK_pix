@@ -8,6 +8,7 @@ import glob
 import struct
 import io
 import hashlib
+import fnmatch
 
 try:
     import cv2
@@ -300,6 +301,7 @@ class RKAdvancedImageLoader:
     - Frame-by-frame mode: each run outputs the next frame (frame 1, frame 2, frame 3...)
     - Batch mode: load all images from a folder matching a pattern
     - Dual output: normal IMAGE + RAW EXR output (for EXR Converter node)
+    - Upload single image option
     - Start/end frame range control
     - Enable/disable toggle
     """
@@ -316,10 +318,22 @@ class RKAdvancedImageLoader:
 
     @classmethod
     def INPUT_TYPES(cls):
+        input_dir = folder_paths.get_input_directory()
+        
+        # Collect all image files from input directory for upload option
+        all_files = []
+        if os.path.exists(input_dir):
+            for f in sorted(os.listdir(input_dir)):
+                f_lower = f.lower()
+                if any(f_lower.endswith(ext) for ext in cls.ALL_EXTENSIONS):
+                    all_files.append(f)
+        
         return {
             "required": {
-                "folder_path": ("STRING", {"default": "", "tooltip": "FULL folder path to your image sequence (e.g., /home/user/renders or D:\\Renders\\Seq)"}),
-                "pattern": ("STRING", {"default": "*", "tooltip": "File pattern to match (e.g., *.png, frame_*.exr, render_*.jpg). Use * for all images."}),
+                "source_type": (["folder_path", "upload_image"], {"default": "folder_path", "tooltip": "folder_path=load from folder, upload_image=load single uploaded image"}),
+                "folder_path": ("STRING", {"default": "", "tooltip": "FULL folder path to your image sequence (e.g., /home/user/renders). Only used when source_type=folder_path"}),
+                "pattern": ("STRING", {"default": "*", "tooltip": "File pattern to match (e.g., *.png, frame_*.exr). Use * for all images. Only for folder_path mode."}),
+                "uploaded_image": (sorted(all_files), {"tooltip": "Select an uploaded image from ComfyUI input folder. Only used when source_type=upload_image"}),
                 "enable": ("BOOLEAN", {"default": True, "tooltip": "Enable/disable this node"}),
                 "mode": (["frame_by_frame", "batch", "single"], {"default": "frame_by_frame", "tooltip": "frame_by_frame=play one image per run, batch=load all as batch, single=load first image only"}),
                 "start_frame": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1, "tooltip": "Starting frame index (0=first image in sorted list)"}),
@@ -341,7 +355,7 @@ class RKAdvancedImageLoader:
     CATEGORY = "rk_pix/image"
     FUNCTION = "load_image"
 
-    def load_image(self, folder_path, pattern, enable, mode, start_frame, end_frame, step, loop, reset,
+    def load_image(self, source_type, folder_path, pattern, uploaded_image, enable, mode, start_frame, end_frame, step, loop, reset,
                    sort_by="name_natural", unique_id=None):
         
         if not enable:
@@ -349,6 +363,19 @@ class RKAdvancedImageLoader:
             mask = torch.zeros((1, 64, 64))
             return (dummy, mask, dummy, 0, 0, "[DISABLED] Node is off", "")
 
+        # === UPLOAD IMAGE MODE ===
+        if source_type == "upload_image":
+            input_dir = folder_paths.get_input_directory()
+            filepath = os.path.join(input_dir, uploaded_image)
+            
+            if not os.path.exists(filepath):
+                raise Exception(f"[RKAdvancedImageLoader] Uploaded image not found: {filepath}")
+            
+            img_tensor, mask_tensor, raw_exr_tensor, info_text = self._load_file_with_raw(filepath)
+            info = f"Uploaded: {info_text}"
+            return (img_tensor, mask_tensor, raw_exr_tensor, 0, 1, info, filepath)
+
+        # === FOLDER PATH MODE ===
         # Validate folder path
         if not folder_path or not folder_path.strip():
             raise Exception("[RKAdvancedImageLoader] folder_path is empty. Please enter a folder path.")
@@ -678,17 +705,29 @@ class RKAdvancedImageLoader:
                 for text in re.split(r'([0-9]+)', s)]
 
     @classmethod
-    def IS_CHANGED(cls, folder_path, pattern, enable, mode, start_frame, end_frame, step, loop, reset,
+    def IS_CHANGED(cls, source_type, folder_path, pattern, uploaded_image, enable, mode, start_frame, end_frame, step, loop, reset,
                    sort_by="name_natural", unique_id=None):
-        if not enable or mode != "frame_by_frame":
-            if folder_path and folder_path.strip():
-                folder = os.path.normpath(folder_path.strip())
-                if os.path.exists(folder) and os.path.isdir(folder):
-                    m = hashlib.sha256()
-                    for f in sorted(os.listdir(folder))[:50]:
-                        m.update(f.encode())
-                    return m.digest().hex()
+        if not enable:
+            return ""
+        if source_type == "upload_image":
+            input_dir = folder_paths.get_input_directory()
+            filepath = os.path.join(input_dir, uploaded_image)
+            if os.path.exists(filepath):
+                m = hashlib.sha256()
+                with open(filepath, 'rb') as f:
+                    m.update(f.read())
+                return m.digest().hex()
             return float("NaN")
+        # folder_path mode
+        if mode == "frame_by_frame":
+            return float("NaN")
+        if folder_path and folder_path.strip():
+            folder = os.path.normpath(folder_path.strip())
+            if os.path.exists(folder) and os.path.isdir(folder):
+                m = hashlib.sha256()
+                for f in sorted(os.listdir(folder))[:50]:
+                    m.update(f.encode())
+                return m.digest().hex()
         return float("NaN")
 
 
