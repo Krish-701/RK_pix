@@ -296,135 +296,98 @@ class RKAdvancedImageLoader:
     
     Features:
     - Load any image format (PNG, JPG, WEBP, BMP, TIFF, TGA, EXR, HDR, etc.)
+    - Custom folder path input - type any folder on your system
+    - Frame-by-frame mode: each run outputs the next frame (frame 1, frame 2, frame 3...)
     - Batch mode: load all images from a folder matching a pattern
-    - Frame-by-frame mode: each run outputs the next frame (like a player)
-    - EXR support with color space conversion (Linear, sRGB, custom gamma, custom LUT)
-    - Auto-convert EXR to PNG with configurable bit depth
+    - Dual output: normal IMAGE + RAW EXR output (for EXR Converter node)
     - Start/end frame range control
     - Enable/disable toggle
     """
 
-    _player_states = {}  # unique_id -> {current_index, start_index}
+    _player_states = {}  # unique_id -> {current_index}
+
+    # Supported image extensions
+    ALL_EXTENSIONS = [
+        '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif',
+        '.tga', '.dds', '.exr', '.hdr', '.pic', '.pnm', '.ppm',
+        '.pgm', '.pbm', '.pfm', '.sgi', '.ras', '.sun', '.ico',
+        '.icns', '.psd', '.xpm', '.xbm'
+    ]
 
     @classmethod
     def INPUT_TYPES(cls):
-        input_dir = folder_paths.get_input_directory()
-        
-        # Collect all image files from input directory
-        all_files = []
-        if os.path.exists(input_dir):
-            for f in sorted(os.listdir(input_dir)):
-                f_lower = f.lower()
-                if any(f_lower.endswith(ext) for ext in [
-                    '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif',
-                    '.tga', '.dds', '.exr', '.hdr', '.pic', '.pnm', '.ppm',
-                    '.pgm', '.pbm', '.pfm', '.sgi', '.ras', '.sun', '.ico',
-                    '.icns', '.psd', '.xpm', '.xbm'
-                ]):
-                    all_files.append(f)
-        
         return {
             "required": {
-                "image": (sorted(all_files), {"tooltip": "Select an image file from ComfyUI input folder. For custom path mode, this is ignored."}),
+                "folder_path": ("STRING", {"default": "", "tooltip": "FULL folder path to your image sequence (e.g., /home/user/renders or D:\\Renders\\Seq)"}),
+                "pattern": ("STRING", {"default": "*", "tooltip": "File pattern to match (e.g., *.png, frame_*.exr, render_*.jpg). Use * for all images."}),
                 "enable": ("BOOLEAN", {"default": True, "tooltip": "Enable/disable this node"}),
-                "mode": (["single", "batch_folder", "batch_pattern", "frame_by_frame"], {"default": "single", "tooltip": "single=load one image, batch_folder=load all images in same folder, batch_pattern=load matching pattern, frame_by_frame=play one frame per run"}),
-                "start_frame": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1, "tooltip": "Starting frame index (0=first)"}),
-                "end_frame": ("INT", {"default": -1, "min": -1, "max": 99999, "step": 1, "tooltip": "End frame index (-1=last frame)"}),
-                "step": ("INT", {"default": 1, "min": 1, "max": 100, "step": 1, "tooltip": "Frame step size"}),
-                "loop": ("BOOLEAN", {"default": True, "tooltip": "Loop back to start after reaching end"}),
+                "mode": (["frame_by_frame", "batch", "single"], {"default": "frame_by_frame", "tooltip": "frame_by_frame=play one image per run, batch=load all as batch, single=load first image only"}),
+                "start_frame": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1, "tooltip": "Starting frame index (0=first image in sorted list)"}),
+                "end_frame": ("INT", {"default": -1, "min": -1, "max": 99999, "step": 1, "tooltip": "End frame index (-1=last image)"}),
+                "step": ("INT", {"default": 1, "min": 1, "max": 100, "step": 1, "tooltip": "Skip N images (1=every image, 2=every other)"}),
+                "loop": ("BOOLEAN", {"default": True, "tooltip": "Loop back to start after last frame"}),
                 "reset": ("BOOLEAN", {"default": False, "tooltip": "Reset to start frame on next run"}),
             },
             "optional": {
-                "pattern": ("STRING", {"default": "*.png", "tooltip": "Glob pattern for batch_pattern mode (e.g., *.png, frame_*.jpg, render_*.exr)"}),
-                "sort_by": (["name", "name_natural", "modified_time", "size"], {"default": "name_natural", "tooltip": "How to sort batch files"}),
-                "custom_folder": ("STRING", {"default": "", "tooltip": "FULL custom folder path (e.g., /home/user/images or D:\\Renders\\Seq). When set, ignores the 'image' dropdown and loads from this path directly."}),
+                "sort_by": (["name_natural", "name", "modified_time", "size"], {"default": "name_natural", "tooltip": "How to sort files: name_natural=frame_001,frame_002... name=alphabetical"}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT", "STRING", "STRING")
-    RETURN_NAMES = ("image", "mask", "current_frame", "total_frames", "info", "filepath")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "INT", "INT", "STRING", "STRING")
+    RETURN_NAMES = ("image", "mask", "raw_exr", "current_frame", "total_frames", "info", "filepath")
     CATEGORY = "rk_pix/image"
     FUNCTION = "load_image"
 
-    def load_image(self, image, enable, mode, start_frame, end_frame, step, loop, reset,
-                   pattern="*.png", sort_by="name_natural", custom_folder="", unique_id=None):
+    def load_image(self, folder_path, pattern, enable, mode, start_frame, end_frame, step, loop, reset,
+                   sort_by="name_natural", unique_id=None):
         
         if not enable:
-            # Return a single black pixel image when disabled
             dummy = torch.zeros((1, 64, 64, 3))
             mask = torch.zeros((1, 64, 64))
-            return (dummy, mask, 0, 0, "[DISABLED] Node is off", "")
+            return (dummy, mask, dummy, 0, 0, "[DISABLED] Node is off", "")
 
-        # Determine the base folder path
-        if custom_folder and custom_folder.strip():
-            # Use custom folder path
-            folder = os.path.normpath(custom_folder.strip())
-            if not os.path.exists(folder):
-                raise Exception(f"[RKAdvancedImageLoader] Custom folder not found: {folder}")
-            if not os.path.isdir(folder):
-                raise Exception(f"[RKAdvancedImageLoader] Custom path is not a folder: {folder}")
-            # For single mode with custom folder, try to use the 'image' as a filename in that folder
-            input_dir = folder
-            selected_path = os.path.join(folder, image) if image else ""
-        else:
-            # Use ComfyUI input directory
-            input_dir = folder_paths.get_input_directory()
-            selected_path = os.path.join(input_dir, image)
-            folder = input_dir
+        # Validate folder path
+        if not folder_path or not folder_path.strip():
+            raise Exception("[RKAdvancedImageLoader] folder_path is empty. Please enter a folder path.")
         
-        if selected_path and not os.path.exists(selected_path) and mode == "single":
-            raise Exception(f"[RKAdvancedImageLoader] File not found: {selected_path}")
+        folder = os.path.normpath(folder_path.strip())
+        if not os.path.exists(folder):
+            raise Exception(f"[RKAdvancedImageLoader] Folder not found: {folder}")
+        if not os.path.isdir(folder):
+            raise Exception(f"[RKAdvancedImageLoader] Path is not a folder: {folder}")
 
-        # Determine file list based on mode
-        if mode == "single":
-            if selected_path and os.path.exists(selected_path):
-                file_list = [selected_path]
-            else:
-                # Try to find first image in the folder
-                all_exts = [
-                    '*.png', '*.jpg', '*.jpeg', '*.webp', '*.bmp', '*.tiff', '*.tif',
-                    '*.tga', '*.dds', '*.exr', '*.hdr', '*.pic', '*.pnm', '*.ppm',
-                    '*.pgm', '*.pbm', '*.pfm', '*.sgi', '*.ras', '*.sun', '*.ico',
-                    '*.psd', '*.xpm', '*.xbm'
-                ]
-                temp_list = []
-                for ext in all_exts:
-                    temp_list.extend(glob.glob(os.path.join(folder, ext)))
-                    temp_list.extend(glob.glob(os.path.join(folder, ext.upper())))
-                temp_list = sorted(list(set(temp_list)))
-                if temp_list:
-                    file_list = [temp_list[0]]
-                else:
-                    raise Exception(f"[RKAdvancedImageLoader] No images found in folder: {folder}")
-        elif mode == "batch_folder":
-            # Get all supported image files in the folder
-            all_exts = [
-                '*.png', '*.jpg', '*.jpeg', '*.webp', '*.bmp', '*.tiff', '*.tif',
-                '*.tga', '*.dds', '*.exr', '*.hdr', '*.pic', '*.pnm', '*.ppm',
-                '*.pgm', '*.pbm', '*.pfm', '*.sgi', '*.ras', '*.sun', '*.ico',
-                '*.psd', '*.xpm', '*.xbm'
-            ]
-            file_list = []
-            for ext in all_exts:
-                file_list.extend(glob.glob(os.path.join(folder, ext)))
-                file_list.extend(glob.glob(os.path.join(folder, ext.upper())))
-            # Remove duplicates and sort
-            file_list = sorted(list(set(file_list)))
-        elif mode in ("batch_pattern", "frame_by_frame"):
-            if os.path.isabs(pattern):
-                search_path = pattern
-            else:
-                search_path = os.path.join(folder, pattern)
-            file_list = glob.glob(search_path)
-            file_list = sorted(list(set(file_list)))
+        # Build search pattern
+        if os.path.isabs(pattern):
+            search_path = pattern
         else:
-            file_list = [selected_path] if selected_path else []
-
+            search_path = os.path.join(folder, pattern)
+        
+        # Find all matching files
+        file_list = glob.glob(search_path)
+        
+        # Also try case-insensitive match
         if not file_list:
-            raise Exception(f"[RKAdvancedImageLoader] No files found for mode '{mode}' with pattern '{pattern}'")
+            folder_name = os.path.dirname(search_path)
+            file_pattern = os.path.basename(search_path)
+            if os.path.exists(folder_name):
+                for f in os.listdir(folder_name):
+                    if fnmatch.fnmatch(f.lower(), file_pattern.lower()):
+                        file_list.append(os.path.join(folder_name, f))
+        
+        if not file_list:
+            raise Exception(f"[RKAdvancedImageLoader] No files found in '{folder}' matching pattern '{pattern}'")
+        
+        # Remove duplicates
+        file_list = sorted(list(set(file_list)))
+        
+        # Filter to only image files
+        file_list = [f for f in file_list if any(f.lower().endswith(ext) for ext in self.ALL_EXTENSIONS)]
+        
+        if not file_list:
+            raise Exception(f"[RKAdvancedImageLoader] No valid image files found in '{folder}' matching pattern '{pattern}'")
 
         # Sort files
         if sort_by == "name":
@@ -444,28 +407,26 @@ class RKAdvancedImageLoader:
         effective_end = min(effective_end, total_files - 1)
 
         if effective_start > effective_end:
-            raise Exception(f"[RKAdvancedImageLoader] Start frame {effective_start} > end frame {effective_end}")
+            raise Exception(f"[RKAdvancedImageLoader] Start frame {effective_start} > end frame {effective_end} (total: {total_files})")
 
         # Slice the file list
         ranged_files = file_list[effective_start:effective_end + 1:step]
         ranged_total = len(ranged_files)
 
         if mode == "frame_by_frame":
-            # Frame-by-frame playback logic
+            # Frame-by-frame: each run outputs next image
             state_key = unique_id if unique_id else "default"
             
             if reset:
-                self._player_states[state_key] = {"current": 0, "start": 0}
+                self._player_states[state_key] = 0
                 current_idx = 0
             else:
                 if state_key not in self._player_states:
-                    self._player_states[state_key] = {"current": 0, "start": 0}
-                
-                state = self._player_states[state_key]
-                current_idx = state["current"] % ranged_total if ranged_total > 0 else 0
+                    self._player_states[state_key] = 0
+                current_idx = self._player_states[state_key] % ranged_total
             
             current_file = ranged_files[current_idx]
-            img_tensor, mask_tensor, info_text = self._load_single_file(current_file)
+            img_tensor, mask_tensor, raw_exr_tensor, info_text = self._load_file_with_raw(current_file)
             
             # Calculate next index
             next_idx = current_idx + 1
@@ -475,51 +436,63 @@ class RKAdvancedImageLoader:
                 else:
                     next_idx = ranged_total - 1
             
-            self._player_states[state_key]["current"] = next_idx
+            self._player_states[state_key] = next_idx
             
             actual_frame_num = effective_start + (current_idx * step)
-            info = f"▶ Frame {current_idx + 1}/{ranged_total} (File #{actual_frame_num + 1}/{total_files}) | {info_text}"
+            info = f"Frame {current_idx + 1}/{ranged_total} (File #{actual_frame_num + 1}/{total_files}) | {info_text}"
             
-            return (img_tensor, mask_tensor, current_idx, ranged_total, info, current_file)
+            return (img_tensor, mask_tensor, raw_exr_tensor, current_idx, ranged_total, info, current_file)
         
-        else:
-            # Batch mode: load all images in the range
+        elif mode == "batch":
+            # Batch mode: load all images
             images = []
             masks = []
+            raw_exrs = []
             
             for fpath in ranged_files:
-                img_tensor, mask_tensor, _ = self._load_single_file(fpath)
+                img_tensor, mask_tensor, raw_exr_tensor, _ = self._load_file_with_raw(fpath)
                 images.append(img_tensor)
                 masks.append(mask_tensor)
+                raw_exrs.append(raw_exr_tensor)
             
-            # Stack into batch
             batch_images = torch.cat(images, dim=0)
             batch_masks = torch.cat(masks, dim=0)
+            batch_raw = torch.cat(raw_exrs, dim=0)
             
-            info = f"Batch: {ranged_total} files | Range: {effective_start}-{effective_end} | Step: {step} | Total in folder: {total_files}"
+            info = f"Batch: {ranged_total} files | Range: {effective_start}-{effective_end} | Step: {step} | Total: {total_files}"
             
-            return (batch_images, batch_masks, 0, ranged_total, info, file_list[0] if file_list else "")
+            return (batch_images, batch_masks, batch_raw, 0, ranged_total, info, file_list[0] if file_list else "")
+        
+        else:  # single mode
+            current_file = ranged_files[0]
+            img_tensor, mask_tensor, raw_exr_tensor, info_text = self._load_file_with_raw(current_file)
+            info = f"Single: {info_text}"
+            return (img_tensor, mask_tensor, raw_exr_tensor, 0, ranged_total, info, current_file)
 
-    def _load_single_file(self, filepath):
-        """Load a single image file and return (image_tensor, mask_tensor, info)."""
+    def _load_file_with_raw(self, filepath):
+        """
+        Load a file and return both processed image AND raw EXR data.
+        For EXR: returns (tonemapped_image, mask, raw_float_exr, info)
+        For others: returns (image, mask, same_image_as_raw, info)
+        """
         ext = os.path.splitext(filepath)[1].lower()
         
         if ext == '.exr':
-            return self._load_exr(filepath)
+            return self._load_exr_dual(filepath)
         elif ext in ('.hdr', '.pic'):
-            return self._load_hdr(filepath)
+            img, mask, info = self._load_hdr(filepath)
+            return (img, mask, img, info)
         else:
-            return self._load_standard(filepath)
+            img, mask, info = self._load_standard(filepath)
+            return (img, mask, img, info)
 
     def _load_standard(self, filepath):
         """Load standard image formats using PIL."""
         img = Image.open(filepath)
         
-        # Handle animated formats by taking first frame
         if getattr(img, 'is_animated', False):
             img.seek(0)
         
-        # Convert to RGB/RGBA
         if img.mode == 'RGBA':
             rgb = img.convert('RGB')
             alpha = np.array(img.split()[-1]).astype(np.float32) / 255.0
@@ -534,7 +507,6 @@ class RKAdvancedImageLoader:
             mask = torch.from_numpy(alpha).unsqueeze(0)
             img_arr = np.array(rgb).astype(np.float32) / 255.0
         elif img.mode == 'I':
-            # 32-bit integer - normalize
             arr = np.array(img)
             img_arr = np.clip(arr.astype(np.float32) / 65535.0, 0, 1)
             img_arr = np.stack([img_arr] * 3, axis=-1) if len(img_arr.shape) == 2 else img_arr
@@ -542,7 +514,6 @@ class RKAdvancedImageLoader:
                 img_arr = np.repeat(img_arr, 3, axis=-1)
             mask = torch.ones((1, img_arr.shape[0], img_arr.shape[1]))
         elif img.mode == 'F':
-            # 32-bit float
             arr = np.array(img)
             img_arr = np.clip(arr.astype(np.float32), 0, 1)
             img_arr = np.stack([img_arr] * 3, axis=-1) if len(img_arr.shape) == 2 else img_arr
@@ -557,7 +528,6 @@ class RKAdvancedImageLoader:
             img_arr = np.array(img).astype(np.float32) / 255.0
             mask = torch.ones((1, img_arr.shape[0], img_arr.shape[1]))
         
-        # Ensure shape is [H, W, 3]
         if len(img_arr.shape) == 2:
             img_arr = np.stack([img_arr] * 3, axis=-1)
         elif img_arr.shape[-1] == 4:
@@ -566,21 +536,24 @@ class RKAdvancedImageLoader:
             img_arr = np.repeat(img_arr, 3, axis=-1)
         
         tensor = torch.from_numpy(img_arr).unsqueeze(0)
-        
-        info = f"{os.path.basename(filepath)} | {tensor.shape[2]}x{tensor.shape[1]} | {os.path.splitext(filepath)[1].upper()}"
+        info = f"{os.path.basename(filepath)} | {tensor.shape[2]}x{tensor.shape[1]} | {ext.upper()}"
         return (tensor, mask, info)
 
-    def _load_exr(self, filepath):
-        """Load EXR file with color space handling."""
+    def _load_exr_dual(self, filepath):
+        """
+        Load EXR and return BOTH:
+        - processed: tonemapped/clamped for display [0-1]
+        - raw: original float values (may be >1) for EXR Converter
+        """
         if OPENEXR_AVAILABLE:
-            return self._load_exr_openexr(filepath)
+            return self._load_exr_dual_openexr(filepath)
         elif CV2_AVAILABLE:
-            return self._load_exr_cv2(filepath)
+            return self._load_exr_dual_cv2(filepath)
         else:
-            raise Exception("[RKAdvancedImageLoader] No EXR loader available. Install OpenEXR or OpenCV with EXR support.")
+            raise Exception("[RKAdvancedImageLoader] No EXR loader available. Install OpenEXR or OpenCV.")
 
-    def _load_exr_openexr(self, filepath):
-        """Load EXR using OpenEXR library (best quality)."""
+    def _load_exr_dual_openexr(self, filepath):
+        """Load EXR with OpenEXR - returns (processed, mask, raw, info)."""
         exr_file = OpenEXR.InputFile(filepath)
         header = exr_file.header()
         
@@ -588,19 +561,14 @@ class RKAdvancedImageLoader:
         width = dw.max.x - dw.min.x + 1
         height = dw.max.y - dw.min.y + 1
         
-        # Determine channel format
         pt = Imath.PixelType(Imath.PixelType.FLOAT)
-        
-        # Read channels
         channels = header['channels'].keys()
         
-        # Try to get RGB or RGBA
         r_str = exr_file.channel('R', pt) if 'R' in channels else None
         g_str = exr_file.channel('G', pt) if 'G' in channels else None
         b_str = exr_file.channel('B', pt) if 'B' in channels else None
         a_str = exr_file.channel('A', pt) if 'A' in channels else None
         
-        # Fallback to Y if no RGB
         if r_str is None and 'Y' in channels:
             y_str = exr_file.channel('Y', pt)
             y = np.frombuffer(y_str, dtype=np.float32).reshape((height, width))
@@ -610,14 +578,14 @@ class RKAdvancedImageLoader:
         
         if r_str is None:
             exr_file.close()
-            raise Exception(f"[RKAdvancedImageLoader] No recognizable channels in EXR: {channels}")
+            raise Exception(f"No recognizable channels in EXR: {channels}")
         
         r = np.frombuffer(r_str, dtype=np.float32).reshape((height, width))
         g = np.frombuffer(g_str, dtype=np.float32).reshape((height, width)) if g_str is not None else r.copy()
         b = np.frombuffer(b_str, dtype=np.float32).reshape((height, width)) if b_str is not None else r.copy()
         
-        # Stack to RGB
-        img_arr = np.stack([r, g, b], axis=-1)
+        # RAW float array (may contain values > 1)
+        raw_arr = np.stack([r, g, b], axis=-1)
         
         # Handle alpha
         if a_str is not None:
@@ -628,56 +596,60 @@ class RKAdvancedImageLoader:
         
         exr_file.close()
         
-        # EXR is typically linear, may contain values > 1
-        # Apply simple tone mapping / normalization for display
-        max_val = img_arr.max()
+        max_val = raw_arr.max()
+        
+        # PROCESSED: tonemapped for display [0-1]
+        processed_arr = raw_arr.copy()
         if max_val > 1.0:
-            # ACES-inspired simple tone mapping
-            img_arr = img_arr / (1.0 + img_arr)
+            processed_arr = processed_arr / (1.0 + processed_arr)
+        processed_arr = np.clip(processed_arr, 0, 1)
+        processed_tensor = torch.from_numpy(processed_arr.astype(np.float32)).unsqueeze(0)
         
-        img_arr = np.clip(img_arr, 0, 1)
-        tensor = torch.from_numpy(img_arr.astype(np.float32)).unsqueeze(0)
+        # RAW: original float values (for EXR Converter)
+        raw_clamped = np.clip(raw_arr, 0, 65504.0)
+        raw_tensor = torch.from_numpy(raw_clamped.astype(np.float32)).unsqueeze(0)
         
-        info = f"{os.path.basename(filepath)} | {width}x{height} | EXR (OpenEXR) | Max: {max_val:.4f}"
-        return (tensor, mask, info)
+        info = f"{os.path.basename(filepath)} | {width}x{height} | EXR | Max: {max_val:.4f}"
+        return (processed_tensor, mask, raw_tensor, info)
 
-    def _load_exr_cv2(self, filepath):
-        """Load EXR using OpenCV (fallback)."""
+    def _load_exr_dual_cv2(self, filepath):
+        """Load EXR with cv2 - returns (processed, mask, raw, info)."""
         img = cv2.imread(filepath, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
         
         if img is None:
-            raise Exception(f"[RKAdvancedImageLoader] cv2 failed to load EXR: {filepath}")
+            raise Exception(f"cv2 failed to load EXR: {filepath}")
         
-        # cv2 loads as BGR
         if len(img.shape) == 3:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            if img.dtype == np.float32:
-                # Already float
-                img_arr = img
-            else:
-                # Half float or other - convert
-                img_arr = img.astype(np.float32)
-                if img_arr.max() > 1.0:
-                    img_arr = img_arr / 65535.0
+            if img.dtype != np.float32:
+                img = img.astype(np.float32)
+                if img.max() > 1.0:
+                    img = img / 65535.0
         else:
-            # Grayscale
-            img_arr = img.astype(np.float32)
-            if img_arr.max() > 1.0:
-                img_arr = img_arr / 65535.0
-            img_arr = np.stack([img_arr] * 3, axis=-1)
+            img = img.astype(np.float32)
+            if img.max() > 1.0:
+                img = img / 65535.0
+            img = np.stack([img] * 3, axis=-1)
         
-        # Tone map if needed
-        max_val = img_arr.max()
+        raw_arr = img.copy()
+        max_val = raw_arr.max()
+        
+        # PROCESSED: tonemapped
+        processed_arr = raw_arr.copy()
         if max_val > 1.0:
-            img_arr = img_arr / (1.0 + img_arr)
+            processed_arr = processed_arr / (1.0 + processed_arr)
+        processed_arr = np.clip(processed_arr, 0, 1)
+        processed_tensor = torch.from_numpy(processed_arr).unsqueeze(0)
         
-        img_arr = np.clip(img_arr, 0, 1)
-        h, w = img_arr.shape[:2]
-        tensor = torch.from_numpy(img_arr).unsqueeze(0)
+        # RAW: keep original float values
+        raw_clamped = np.clip(raw_arr, 0, 65504.0)
+        raw_tensor = torch.from_numpy(raw_clamped).unsqueeze(0)
+        
+        h, w = raw_arr.shape[:2]
         mask = torch.ones((1, h, w))
         
         info = f"{os.path.basename(filepath)} | {w}x{h} | EXR (cv2) | Max: {max_val:.4f}"
-        return (tensor, mask, info)
+        return (processed_tensor, mask, raw_tensor, info)
 
     def _load_hdr(self, filepath):
         """Load HDR/Radiance format."""
@@ -687,7 +659,6 @@ class RKAdvancedImageLoader:
                 if len(img.shape) == 3:
                     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 img_arr = img.astype(np.float32)
-                # Tone map
                 max_val = img_arr.max()
                 if max_val > 1.0:
                     img_arr = img_arr / (1.0 + img_arr)
@@ -698,40 +669,26 @@ class RKAdvancedImageLoader:
                 info = f"{os.path.basename(filepath)} | {w}x{h} | HDR | Max: {max_val:.4f}"
                 return (tensor, mask, info)
         
-        # Fallback: try PIL
         return self._load_standard(filepath)
 
     def _natural_sort_key(self, s):
-        """Natural sort key for filenames like frame_001, frame_002, etc."""
+        """Natural sort key for filenames like frame_001, frame_002."""
         import re
         return [int(text) if text.isdigit() else text.lower() 
                 for text in re.split(r'([0-9]+)', s)]
 
     @classmethod
-    def IS_CHANGED(cls, image, enable, mode, start_frame, end_frame, step, loop, reset,
-                   pattern="*.png", sort_by="name_natural", custom_folder="", unique_id=None):
+    def IS_CHANGED(cls, folder_path, pattern, enable, mode, start_frame, end_frame, step, loop, reset,
+                   sort_by="name_natural", unique_id=None):
         if not enable or mode != "frame_by_frame":
-            # For batch/single modes, check if files changed
-            if custom_folder and custom_folder.strip():
-                folder = os.path.normpath(custom_folder.strip())
+            if folder_path and folder_path.strip():
+                folder = os.path.normpath(folder_path.strip())
                 if os.path.exists(folder) and os.path.isdir(folder):
-                    # Hash the folder contents for change detection
-                    all_files = []
-                    for f in sorted(os.listdir(folder)):
-                        fpath = os.path.join(folder, f)
-                        if os.path.isfile(fpath):
-                            all_files.append(fpath)
                     m = hashlib.sha256()
-                    for fpath in sorted(all_files)[:50]:  # Limit to first 50 files
-                        m.update(os.path.basename(fpath).encode())
+                    for f in sorted(os.listdir(folder))[:50]:
+                        m.update(f.encode())
                     return m.digest().hex()
-            input_dir = folder_paths.get_input_directory()
-            filepath = os.path.join(input_dir, image)
-            if os.path.exists(filepath):
-                m = hashlib.sha256()
-                with open(filepath, 'rb') as f:
-                    m.update(f.read())
-                return m.digest().hex()
+            return float("NaN")
         return float("NaN")
 
 
