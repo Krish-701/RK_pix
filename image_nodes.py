@@ -986,6 +986,7 @@ class RK_EXRConverter:
                 "exposure": ("FLOAT", {"default": 0.0, "min": -10.0, "max": 10.0, "step": 0.01, "tooltip": "Exposure adjustment in stops"}),
                 "tone_map": (["none", "reinhard", "aces", "filmic", "agx"], {"default": "aces", "tooltip": "Tone mapping algorithm"}),
                 "output_depth": (["8bit", "16bit", "32bit"], {"default": "16bit", "tooltip": "Output bit depth for PNG"}),
+                "preserve_exr": ("BOOLEAN", {"default": True, "tooltip": "ON=use only reversible ops (linear scale) for perfect EXR round-trip. OFF=full tone mapping for best display quality."}),
                 "auto_save_png": ("BOOLEAN", {"default": False, "tooltip": "Automatically save converted PNG to output folder"}),
                 "filename_prefix": ("STRING", {"default": "exr_converted", "tooltip": "Prefix for saved PNG filename"}),
             },
@@ -1002,7 +1003,7 @@ class RK_EXRConverter:
     OUTPUT_NODE = True
 
     def convert_exr(self, raw_exr, enable, color_space, gamma, exposure, tone_map,
-                    output_depth, auto_save_png, filename_prefix, custom_lut="None", exr_data=None):
+                    output_depth, preserve_exr, auto_save_png, filename_prefix, custom_lut="None", exr_data=None):
         
         if not enable:
             dummy = torch.zeros((1, 64, 64, 3))
@@ -1015,41 +1016,77 @@ class RK_EXRConverter:
         # raw_exr is a torch tensor [B, H, W, 3] with float values (may be > 1)
         img_arr = raw_exr[0].cpu().numpy().astype(np.float32)  # Take first batch item
         h, w = img_arr.shape[:2]
-        max_val = img_arr.max()
+        raw_max_val = img_arr.max()
         
-        # Apply exposure
-        if exposure != 0:
-            img_arr = img_arr * (2.0 ** exposure)
+        # === PRESERVE EXR MODE: Only reversible operations ===
+        if preserve_exr:
+            # Apply exposure (reversible: just multiply/divide)
+            if exposure != 0:
+                img_arr = img_arr * (2.0 ** exposure)
+            
+            # Linear scale to [0,1] - perfectly reversible!
+            # Just divide by max, so Image To EXR can multiply back
+            current_max = img_arr.max()
+            if current_max > 1.0:
+                img_arr = img_arr / current_max
+            
+            # Skip tone mapping and color space - keep linear
+            # This ensures perfect round-trip back to EXR
+            tone_map_used = "linear_scale (preserve)"
+            color_space_used = "linear (preserve)"
+            
+            # No dithering needed for 32-bit float output
+            if output_depth == "32bit":
+                out_arr = img_arr.astype(np.float32)
+                depth_info = "32-bit float (preserve)"
+            else:
+                # For 8/16 bit, still use dithering for display quality
+                img_arr = np.clip(img_arr, 0, 1)
+                img_arr = self._apply_dithering(img_arr, output_depth)
+                if output_depth == "8bit":
+                    out_arr = (img_arr * 255.0).astype(np.uint8)
+                    depth_info = "8-bit"
+                else:
+                    out_arr = (img_arr * 65535.0).astype(np.uint16)
+                    depth_info = "16-bit"
         
-        # Apply tone mapping
-        img_arr = self._apply_tone_map(img_arr, tone_map)
+        # === DISPLAY MODE: Full tone mapping + color space ===
+        else:
+            # Apply exposure
+            if exposure != 0:
+                img_arr = img_arr * (2.0 ** exposure)
+            
+            # Apply tone mapping
+            img_arr = self._apply_tone_map(img_arr, tone_map)
+            
+            # Apply color space transform
+            input_dir = folder_paths.get_input_directory()
+            img_arr = self._apply_color_space(img_arr, color_space, gamma, custom_lut, input_dir)
+            
+            # Clip to valid range
+            img_arr = np.clip(img_arr, 0, 1)
+            
+            # Apply dithering to reduce banding
+            img_arr = self._apply_dithering(img_arr, output_depth)
+            
+            tone_map_used = tone_map
+            color_space_used = color_space
+            
+            # Convert to output bit depth
+            if output_depth == "8bit":
+                out_arr = (img_arr * 255.0).astype(np.uint8)
+                depth_info = "8-bit"
+            elif output_depth == "16bit":
+                out_arr = (img_arr * 65535.0).astype(np.uint16)
+                depth_info = "16-bit"
+            else:  # 32bit
+                out_arr = img_arr.astype(np.float32)
+                depth_info = "32-bit float"
         
-        # Apply color space transform
-        input_dir = folder_paths.get_input_directory()
-        img_arr = self._apply_color_space(img_arr, color_space, gamma, custom_lut, input_dir)
-        
-        # Clip to valid range
-        img_arr = np.clip(img_arr, 0, 1)
-        
-        # Apply dithering to reduce banding
-        img_arr = self._apply_dithering(img_arr, output_depth)
-        
-        # Convert to output bit depth
-        if output_depth == "8bit":
-            out_arr = (img_arr * 255.0).astype(np.uint8)
-            depth_info = "8-bit"
-        elif output_depth == "16bit":
-            out_arr = (img_arr * 65535.0).astype(np.uint16)
-            depth_info = "16-bit"
-        else:  # 32bit - keep float precision
-            out_arr = img_arr.astype(np.float32)
-            depth_info = "32-bit float"
-        
-        # Create tensor from the dithered/quantized array for maximum quality
+        # Create tensor from output array
         if output_depth == "32bit":
             tensor = torch.from_numpy(img_arr.astype(np.float32)).unsqueeze(0)
         else:
-            # For 8/16 bit, convert back through float to preserve the dithering
             tensor = torch.from_numpy(out_arr.astype(np.float32) / (255.0 if output_depth == "8bit" else 65535.0)).unsqueeze(0)
         
         # Auto-save if enabled
@@ -1066,7 +1103,6 @@ class RK_EXRConverter:
             
             # Save with PIL
             if output_depth == "32bit":
-                # For 32-bit, save as 16-bit since most viewers don't support 32-bit PNG well
                 save_arr = (img_arr * 65535.0).astype(np.uint16)
                 pil_img = Image.fromarray(save_arr, mode='RGB')
             else:
@@ -1078,21 +1114,23 @@ class RK_EXRConverter:
             pil_img.save(save_path)
             saved_path = save_path
         
-        # Pass through exr_data with processing info (for display only)
+        # Pass through exr_data with processing info
         if exr_data is not None and isinstance(exr_data, dict):
             out_exr_data = RK_EXRData.from_dict(exr_data)
         else:
             out_exr_data = RK_EXRData()
-            out_exr_data.raw_max = float(max_val)
+            out_exr_data.raw_max = float(raw_max_val)
             out_exr_data.width = w
             out_exr_data.height = h
         
-        # Record processing for info display (not used for reversal)
-        out_exr_data.processed_tone_map = tone_map
-        out_exr_data.processed_color_space = color_space
+        # Record what was done
+        out_exr_data.processed_tone_map = tone_map_used
+        out_exr_data.processed_color_space = color_space_used
         out_exr_data.processed_exposure = float(exposure)
+        out_exr_data.preserve_exr = preserve_exr
         
-        info = f"EXR Convert | {w}x{h} | RawMax: {out_exr_data.raw_max:.4f} | {tone_map} | {color_space} | {depth_info}"
+        mode_str = "PRESERVE" if preserve_exr else "DISPLAY"
+        info = f"EXR Convert [{mode_str}] | {w}x{h} | RawMax: {out_exr_data.raw_max:.4f} | {tone_map_used} | {color_space_used} | {depth_info}"
         if saved_path:
             info += f" | Saved: {os.path.basename(saved_path)}"
         
@@ -1274,7 +1312,7 @@ class RK_EXRConverter:
 
     @classmethod
     def IS_CHANGED(cls, raw_exr, enable, color_space, gamma, exposure, tone_map,
-                   output_depth, auto_save_png, filename_prefix, custom_lut="None"):
+                   output_depth, preserve_exr, auto_save_png, filename_prefix, custom_lut="None"):
         if not enable:
             return ""
         # For IMAGE input, use a hash of the tensor
@@ -1390,6 +1428,7 @@ class RKImageToEXR:
             bit_depth = "half"
             compression = "zip"
             source_info = "default"
+            preserve_mode = False
             
             if exr_data is not None and isinstance(exr_data, dict):
                 # Use metadata pipeline - BEST METHOD
@@ -1397,6 +1436,7 @@ class RKImageToEXR:
                 target_min = exr_data.get('raw_min', 0.0)
                 bit_depth = exr_data.get('bit_depth', 'half')
                 compression = exr_data.get('compression', 'zip')
+                preserve_mode = exr_data.get('preserve_exr', False)
                 source_info = f"exr_data ({exr_data.get('source_type', 'unknown')})"
                 
             elif reference_exr is not None and reference_exr.shape[0] > 0:
@@ -1408,19 +1448,27 @@ class RKImageToEXR:
                 source_info = "reference_exr"
             
             # Step 3: Scale to match original range
-            # current_max is the max of the processed image (typically ~0.95 after tone mapping)
-            # target_max is the original raw max (e.g., 1.92 for ACES, 50.0 for HDR)
-            if current_max > 1e-6 and target_max > current_max:
-                scale = target_max / current_max
+            # When preserve_exr was used, the converter did linear scaling (divide by max)
+            # So we just multiply by original_max - PERFECT reversal!
+            if preserve_mode:
+                # PERFECT round-trip: linear scale was used in converter
+                # img_converter = raw / raw_max
+                # So: raw = img_converter * raw_max
+                scale = target_max / max(current_max, 1e-6)
                 img_arr = img_arr * scale
-            elif target_max <= 1.0 and current_max > 1.0:
-                # Input is already HDR, just clip
-                img_arr = np.clip(img_arr, 0, target_max)
+                source_info += " | PERFECT (linear_scale)"
+            else:
+                # DISPLAY mode: non-linear tone mapping was used
+                # We can only approximate by matching the range
+                if current_max > 1e-6 and target_max > current_max:
+                    scale = target_max / current_max
+                    img_arr = img_arr * scale
+                    source_info += " | APPROX (tone_mapped)"
+                elif target_max <= 1.0 and current_max > 1.0:
+                    img_arr = np.clip(img_arr, 0, target_max)
             
-            # Ensure we don't go below target_min (handle negative values if needed)
+            # Handle negative values if original had them
             if target_min < 0:
-                # The processed image is [0,1], we need to shift to include negative
-                # This is approximate - processed images lose negative values
                 current_min = img_arr.min()
                 if current_min > target_min:
                     shift = target_min - current_min
