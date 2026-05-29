@@ -1080,7 +1080,7 @@ class RKImageToEXR:
     - Auto-detects if reference is linear or sRGB
     - Reverses tone mapping to restore HDR range
     - Preserves original EXR bit depth and compression
-    - Preview output to verify before saving
+    - Dual preview: original input + converted EXR preview
     """
 
     @classmethod
@@ -1099,8 +1099,8 @@ class RKImageToEXR:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("preview", "info")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = ("original_preview", "exr_preview", "info")
     CATEGORY = "rk_pix/image"
     FUNCTION = "convert_to_exr"
     OUTPUT_NODE = True
@@ -1109,7 +1109,7 @@ class RKImageToEXR:
         
         if not enable:
             dummy = torch.zeros((1, 64, 64, 3))
-            return (dummy, "[DISABLED]")
+            return (dummy, dummy, "[DISABLED]")
 
         if image is None or image.shape[0] == 0:
             raise Exception("[RKImageToEXR] No image input provided")
@@ -1119,10 +1119,22 @@ class RKImageToEXR:
         h, w, c = img_tensor.shape
         img_arr = img_tensor.cpu().numpy().astype(np.float32)
         
+        # Store original for preview
+        original_arr = img_arr.copy()
+        
+        # Normalize original for preview
+        orig_max = original_arr.max()
+        if orig_max > 1.0:
+            original_preview_arr = original_arr / 255.0 if orig_max <= 255.0 else original_arr / 65535.0
+        else:
+            original_preview_arr = original_arr.copy()
+        original_preview_arr = np.clip(original_preview_arr, 0, 1)
+        original_preview = torch.from_numpy(original_preview_arr.astype(np.float32)).unsqueeze(0)
+        
         # Analyze reference EXR if provided
         ref_analysis = self._analyze_reference(reference_exr) if reference_exr is not None else None
         
-        # Normalize input to [0,1] if needed
+        # Normalize input to [0,1] if needed for processing
         max_val = img_arr.max()
         if max_val > 1.0:
             img_arr = img_arr / 255.0 if max_val <= 255.0 else img_arr / 65535.0
@@ -1178,14 +1190,14 @@ class RKImageToEXR:
                 saved_name = fname
             except Exception as e:
                 dummy = torch.zeros((1, 64, 64, 3))
-                return (dummy, f"[SAVE ERROR] {str(e)}")
+                return (original_preview, dummy, f"[SAVE ERROR] {str(e)}")
         
-        # Create preview (tonemapped for display)
-        preview_arr = img_arr.copy()
-        if preview_arr.max() > 1.0:
-            preview_arr = preview_arr / (1.0 + preview_arr)
-        preview_arr = np.clip(preview_arr, 0, 1)
-        preview_tensor = torch.from_numpy(preview_arr.astype(np.float32)).unsqueeze(0)
+        # Create EXR preview (tonemapped for display)
+        exr_preview_arr = img_arr.copy()
+        if exr_preview_arr.max() > 1.0:
+            exr_preview_arr = exr_preview_arr / (1.0 + exr_preview_arr)
+        exr_preview_arr = np.clip(exr_preview_arr, 0, 1)
+        exr_preview = torch.from_numpy(exr_preview_arr.astype(np.float32)).unsqueeze(0)
         
         # Build info
         info = f"ImageToEXR | {w}x{h}"
@@ -1198,7 +1210,7 @@ class RKImageToEXR:
         else:
             info += " | Preview only"
         
-        return (preview_tensor, info)
+        return (original_preview, exr_preview, info)
 
     def _analyze_reference(self, reference_exr):
         """Deep analysis of reference EXR to extract all characteristics."""
@@ -1212,17 +1224,12 @@ class RKImageToEXR:
         analysis['std'] = float(ref_arr.std())
         
         # Detect if reference is sRGB-like or linear
-        # sRGB images typically have mean around 0.2-0.5 with compressed shadows
-        # Linear HDR images have different distribution
         if analysis['max_val'] <= 1.0:
-            # Low range - likely sRGB/gamma encoded
             analysis['is_srgb'] = True
             analysis['bit_depth'] = "half"
         else:
-            # High range - linear HDR
-            # Check if values suggest it was sRGB that got expanded
             if analysis['mean'] / analysis['max_val'] < 0.1:
-                analysis['is_srgb'] = False  # True linear HDR
+                analysis['is_srgb'] = False
             else:
                 analysis['is_srgb'] = True
             analysis['bit_depth'] = "half" if analysis['max_val'] < 10.0 else "float"
@@ -1241,15 +1248,8 @@ class RKImageToEXR:
         if ref_max <= 1.0:
             return img_arr
         
-        # Approximate reverse of reinhard tone mapping
-        # If tonemap was: out = in / (1 + in)
-        # Then reverse: in = out / (1 - out)
-        # But we need to be careful about division by zero
-        
-        # Scale to match reference range
         current_max = max(img_arr.max(), 1e-6)
         if current_max < 1.0:
-            # Image was compressed - expand it
             img_arr = img_arr * ref_max
         
         return img_arr
