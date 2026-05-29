@@ -1075,7 +1075,7 @@ class RKImageToEXR:
     - Supports 16-bit and 32-bit float EXR output
     - Optional: connect a reference EXR IMAGE to copy its data characteristics
     - Preview output to see the result before saving
-    - Custom save path and filename
+    - Custom save path and filename with ON/OFF save toggle
     - Preserves as much detail as possible from the original
     """
 
@@ -1085,9 +1085,10 @@ class RKImageToEXR:
             "required": {
                 "image": ("IMAGE", {"tooltip": "Input image (PNG, JPG, or any standard format) to convert to EXR"}),
                 "enable": ("BOOLEAN", {"default": True}),
+                "save_exr": ("BOOLEAN", {"default": True, "tooltip": "ON=save EXR file to disk, OFF=only preview without saving"}),
                 "bit_depth": (["half", "float"], {"default": "half", "tooltip": "EXR bit depth. half=16-bit float, float=32-bit float"}),
                 "compression": (["zip", "zips", "rle", "piz", "pxr24", "b44", "b44a", "dwaa", "dwab", "none"], {"default": "zip", "tooltip": "EXR compression method"}),
-                "save_path": ("STRING", {"default": "", "tooltip": "Full folder path to save EXR (e.g., /home/user/exr_output or D:\\Renders). If empty, uses ComfyUI output folder."}),
+                "save_path": ("STRING", {"default": "", "tooltip": "Full folder path to save EXR (e.g., /home/user/exr_output). If empty, uses ComfyUI output folder."}),
                 "filename": ("STRING", {"default": "output", "tooltip": "EXR filename WITHOUT extension (e.g., my_render, frame_001)"}),
                 "auto_increment": ("BOOLEAN", {"default": True, "tooltip": "If file exists, auto-add _0001, _0002 etc. If False, will overwrite existing file."}),
             },
@@ -1096,23 +1097,23 @@ class RKImageToEXR:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
-    RETURN_NAMES = ("preview", "exr_path", "info")
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("preview", "info")
     CATEGORY = "rk_pix/image"
     FUNCTION = "convert_to_exr"
     OUTPUT_NODE = True
 
-    def convert_to_exr(self, image, enable, bit_depth, compression, save_path, filename, auto_increment, reference_exr=None):
+    def convert_to_exr(self, image, enable, save_exr, bit_depth, compression, save_path, filename, auto_increment, reference_exr=None):
         
         if not enable:
             dummy = torch.zeros((1, 64, 64, 3))
-            return (dummy, "", "[DISABLED]")
+            return (dummy, "[DISABLED]")
 
         if image is None or image.shape[0] == 0:
             raise Exception("[RKImageToEXR] No image input provided")
 
         # Get image data
-        img_tensor = image[0] if len(image.shape) == 4 else image  # Take first batch item
+        img_tensor = image[0] if len(image.shape) == 4 else image
         h, w, c = img_tensor.shape
         
         # Convert to numpy float32
@@ -1124,14 +1125,11 @@ class RKImageToEXR:
         # Determine if image is in [0,1] or [0,255] range
         max_val = img_arr.max()
         if max_val > 1.0:
-            # Likely 8-bit or 16-bit integer data, normalize to [0,1]
             img_arr = img_arr / 255.0 if max_val <= 255.0 else img_arr / 65535.0
         
-        # For EXR, we want to expand the range to make use of HDR
-        # If the image has low dynamic range, expand it
+        # For EXR, expand the range to make use of HDR
         if analysis['dynamic_range'] < 2.0:
-            # Low DR image - expand to use more of the float range
-            img_arr = img_arr * 2.0  # Expand to [0, 2.0]
+            img_arr = img_arr * 2.0
         
         # Split channels
         if c >= 3:
@@ -1143,35 +1141,8 @@ class RKImageToEXR:
                 a = img_arr[:, :, 3]
                 channels['A'] = a
         else:
-            # Grayscale - replicate to RGB
             gray = img_arr[:, :, 0]
             channels = {'R': gray, 'G': gray, 'B': gray}
-        
-        # Determine save location
-        if save_path and save_path.strip():
-            output_dir = os.path.normpath(save_path.strip())
-            if not os.path.exists(output_dir):
-                try:
-                    os.makedirs(output_dir, exist_ok=True)
-                except Exception as e:
-                    raise Exception(f"[RKImageToEXR] Cannot create save directory: {output_dir} - {e}")
-        else:
-            output_dir = folder_paths.get_output_directory()
-        
-        # Build filename
-        base_name = filename.strip() if filename and filename.strip() else "output"
-        
-        if auto_increment:
-            counter = 1
-            while True:
-                fname = f"{base_name}_{counter:04d}.exr"
-                exr_path = os.path.join(output_dir, fname)
-                if not os.path.exists(exr_path):
-                    break
-                counter += 1
-        else:
-            fname = f"{base_name}.exr"
-            exr_path = os.path.join(output_dir, fname)
         
         # Get reference EXR data if provided
         ref_data = None
@@ -1181,11 +1152,9 @@ class RKImageToEXR:
                 'max_val': reference_exr.max().item(),
                 'min_val': reference_exr.min().item(),
             }
-            # If reference has higher range, scale our image to match
             if ref_data['max_val'] > img_arr.max() and ref_data['max_val'] > 1.0:
                 scale_factor = ref_data['max_val'] / max(img_arr.max(), 1e-6)
                 img_arr = img_arr * scale_factor
-                # Rebuild channels with scaled data
                 if c >= 3:
                     channels = {'R': img_arr[:, :, 0], 'G': img_arr[:, :, 1], 'B': img_arr[:, :, 2]}
                     if c >= 4:
@@ -1193,14 +1162,44 @@ class RKImageToEXR:
                 else:
                     channels = {'R': img_arr[:, :, 0], 'G': img_arr[:, :, 0], 'B': img_arr[:, :, 0]}
         
-        # Write EXR using OpenEXR if available
-        if OPENEXR_AVAILABLE:
-            self._save_exr_openexr(exr_path, channels, h, w, bit_depth, compression)
-        elif CV2_AVAILABLE:
-            # Fallback to OpenCV
-            self._save_exr_cv2(exr_path, img_arr)
-        else:
-            raise Exception("[RKImageToEXR] No EXR writer available. Install OpenEXR or OpenCV.")
+        # Save EXR if enabled
+        saved_name = ""
+        if save_exr:
+            if save_path and save_path.strip():
+                output_dir = os.path.normpath(save_path.strip())
+                if not os.path.exists(output_dir):
+                    try:
+                        os.makedirs(output_dir, exist_ok=True)
+                    except Exception as e:
+                        raise Exception(f"[RKImageToEXR] Cannot create save directory: {output_dir} - {e}")
+            else:
+                output_dir = folder_paths.get_output_directory()
+            
+            base_name = filename.strip() if filename and filename.strip() else "output"
+            
+            if auto_increment:
+                counter = 1
+                while True:
+                    fname = f"{base_name}_{counter:04d}.exr"
+                    exr_path = os.path.join(output_dir, fname)
+                    if not os.path.exists(exr_path):
+                        break
+                    counter += 1
+            else:
+                fname = f"{base_name}.exr"
+                exr_path = os.path.join(output_dir, fname)
+            
+            try:
+                if OPENEXR_AVAILABLE:
+                    self._save_exr_openexr(exr_path, channels, h, w, bit_depth, compression)
+                elif CV2_AVAILABLE:
+                    self._save_exr_cv2(exr_path, img_arr)
+                else:
+                    raise Exception("[RKImageToEXR] No EXR writer available. Install OpenEXR or OpenCV.")
+                saved_name = fname
+            except Exception as e:
+                dummy = torch.zeros((1, 64, 64, 3))
+                return (dummy, f"[SAVE ERROR] {str(e)}")
         
         # Create preview image (tonemapped for display)
         preview_arr = img_arr.copy()
@@ -1212,35 +1211,26 @@ class RKImageToEXR:
         info = f"Converted to EXR | {w}x{h} | {bit_depth} | {compression} | DR: {analysis['dynamic_range']:.2f}"
         if ref_data:
             info += f" | Ref scaled: {ref_data['max_val']:.2f}"
-        info += f" | Saved: {fname}"
+        if saved_name:
+            info += f" | Saved: {saved_name}"
+        else:
+            info += " | Preview only (save_exr=OFF)"
         
-        return (preview_tensor, exr_path, info)
+        return (preview_tensor, info)
 
     def _analyze_image(self, img_arr):
-        """Analyze image characteristics for optimal EXR encoding."""
         analysis = {}
-        
-        # Dynamic range (max / min non-zero)
         min_val = img_arr[img_arr > 0].min() if np.any(img_arr > 0) else 1e-6
         max_val = img_arr.max()
         analysis['dynamic_range'] = max_val / min_val if min_val > 0 else 1.0
-        
-        # Mean brightness
         analysis['mean'] = img_arr.mean()
-        
-        # Standard deviation (contrast measure)
         analysis['std'] = img_arr.std()
-        
-        # Check if image has alpha
         analysis['has_alpha'] = img_arr.shape[2] >= 4 if len(img_arr.shape) == 3 else False
-        
         return analysis
 
     def _save_exr_openexr(self, filepath, channels, h, w, bit_depth, compression):
-        """Save EXR using OpenEXR library."""
         import Imath
         
-        # Map compression names to OpenEXR constants
         compression_map = {
             "none": Imath.Compression.NO_COMPRESSION,
             "rle": Imath.Compression.RLE_COMPRESSION,
@@ -1256,45 +1246,36 @@ class RKImageToEXR:
         
         comp = compression_map.get(compression, Imath.Compression.ZIP_COMPRESSION)
         
-        # Pixel type
         if bit_depth == "half":
             pt = Imath.PixelType(Imath.PixelType.HALF)
         else:
             pt = Imath.PixelType(Imath.PixelType.FLOAT)
         
-        # Build header
         header = OpenEXR.Header(w, h)
         header['compression'] = comp
         header['channels'] = {name: pt for name in channels.keys()}
         
-        # Convert channels to bytes
         channel_data = {}
         for name, arr in channels.items():
             if bit_depth == "half":
-                # Convert to float16
                 flat = arr.astype(np.float16).flatten()
                 channel_data[name] = flat.tobytes()
             else:
                 channel_data[name] = arr.astype(np.float32).tobytes()
         
-        # Write
         exr_out = OpenEXR.OutputFile(filepath, header)
         exr_out.writePixels(channel_data)
         exr_out.close()
 
     def _save_exr_cv2(self, filepath, img_arr):
-        """Save EXR using OpenCV (fallback)."""
-        # OpenCV expects BGR format
         if len(img_arr.shape) == 3 and img_arr.shape[2] >= 3:
             bgr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
         else:
             bgr = img_arr
-        
-        # Save with float32
         cv2.imwrite(filepath, bgr.astype(np.float32))
 
     @classmethod
-    def IS_CHANGED(cls, image, enable, bit_depth, compression, save_path, filename, auto_increment, reference_exr=None):
+    def IS_CHANGED(cls, image, enable, save_exr, bit_depth, compression, save_path, filename, auto_increment, reference_exr=None):
         if not enable:
             return ""
         if image is not None:
