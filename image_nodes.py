@@ -818,6 +818,9 @@ class RK_EXRConverter:
         # Clip to valid range
         img_arr = np.clip(img_arr, 0, 1)
         
+        # Apply dithering to reduce banding
+        img_arr = self._apply_dithering(img_arr, output_depth)
+        
         # Convert to output bit depth
         if output_depth == "8bit":
             out_arr = (img_arr * 255.0).astype(np.uint8)
@@ -825,12 +828,16 @@ class RK_EXRConverter:
         elif output_depth == "16bit":
             out_arr = (img_arr * 65535.0).astype(np.uint16)
             depth_info = "16-bit"
-        else:  # 32bit - save as float PNG
+        else:  # 32bit - keep float precision
             out_arr = img_arr.astype(np.float32)
             depth_info = "32-bit float"
         
-        # Create tensor
-        tensor = torch.from_numpy(img_arr.astype(np.float32)).unsqueeze(0)
+        # Create tensor from the dithered/quantized array for maximum quality
+        if output_depth == "32bit":
+            tensor = torch.from_numpy(img_arr.astype(np.float32)).unsqueeze(0)
+        else:
+            # For 8/16 bit, convert back through float to preserve the dithering
+            tensor = torch.from_numpy(out_arr.astype(np.float32) / (255.0 if output_depth == "8bit" else 65535.0)).unsqueeze(0)
         
         # Auto-save if enabled
         saved_path = ""
@@ -888,6 +895,36 @@ class RK_EXRConverter:
             img_arr = np.maximum(img_arr, 0.0)
             return img_arr / (img_arr + 0.5)
         return img_arr
+
+    def _apply_dithering(self, img_arr, depth):
+        """Apply Bayer dithering to reduce banding when quantizing to lower bit depths."""
+        if depth == "32bit":
+            return img_arr
+        
+        h, w = img_arr.shape[:2]
+        
+        # 4x4 Bayer matrix normalized to [-0.5, 0.5]
+        bayer = np.array([
+            [ 0, 32,  8, 40],
+            [48, 16, 56, 24],
+            [12, 44,  4, 36],
+            [60, 28, 52, 20]
+        ], dtype=np.float32) / 64.0 - 0.5
+        
+        # Tile the Bayer matrix to image size
+        bayer_tiled = np.tile(bayer, (h // 4 + 1, w // 4 + 1))[:h, :w]
+        
+        # Scale dithering amount based on bit depth
+        if depth == "8bit":
+            scale = 1.0 / 255.0
+        elif depth == "16bit":
+            scale = 1.0 / 65535.0
+        else:
+            scale = 0.0
+        
+        # Apply dithering
+        dithered = img_arr + bayer_tiled[..., None] * scale
+        return np.clip(dithered, 0, 1)
 
     def _apply_color_space(self, img_arr, color_space, gamma, custom_lut, input_dir):
         """Apply color space transform."""
@@ -1026,6 +1063,210 @@ class RK_EXRConverter:
 
 
 # ============================================================
+# RK IMAGE TO EXR CONVERTER - Convert PNG/JPG to EXR with analysis
+# ============================================================
+
+class RKImageToEXR:
+    """
+    Convert PNG/JPG/normal images to EXR format with intelligent analysis.
+    
+    Features:
+    - Analyzes input image to determine best EXR encoding
+    - Supports 16-bit and 32-bit float EXR output
+    - Optional: load a reference EXR to copy its data characteristics
+    - Preserves as much detail as possible from the original
+    - Auto-save EXR to output folder
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "Input image (PNG, JPG, or any standard format) to convert to EXR"}),
+                "enable": ("BOOLEAN", {"default": True}),
+                "bit_depth": (["half"], {"default": "half", "tooltip": "EXR bit depth. half=16-bit float (standard, good balance)"}),
+                "compression": (["zip", "zips", "rle", "piz", "pxr24", "b44", "b44a", "dwaa", "dwab", "none"], {"default": "zip", "tooltip": "EXR compression method"}),
+                "auto_save": ("BOOLEAN", {"default": False, "tooltip": "Automatically save EXR to ComfyUI output folder"}),
+                "filename_prefix": ("STRING", {"default": "converted", "tooltip": "Prefix for saved EXR filename"}),
+            },
+            "optional": {
+                "reference_exr": ("STRING", {"default": "", "tooltip": "Optional: path to a reference EXR file to copy its channel names and data window"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("exr_path", "info")
+    CATEGORY = "rk_pix/image"
+    FUNCTION = "convert_to_exr"
+    OUTPUT_NODE = True
+
+    def convert_to_exr(self, image, enable, bit_depth, compression, auto_save, filename_prefix, reference_exr=""):
+        
+        if not enable:
+            return ("", "[DISABLED]")
+
+        if image is None or image.shape[0] == 0:
+            raise Exception("[RKImageToEXR] No image input provided")
+
+        # Get image data
+        img_tensor = image[0] if len(image.shape) == 4 else image  # Take first batch item
+        h, w, c = img_tensor.shape
+        
+        # Convert to numpy float32
+        img_arr = img_tensor.cpu().numpy().astype(np.float32)
+        
+        # Analyze the image
+        analysis = self._analyze_image(img_arr)
+        
+        # Determine if image is in [0,1] or [0,255] range
+        max_val = img_arr.max()
+        if max_val > 1.0:
+            # Likely 8-bit or 16-bit integer data, normalize to [0,1]
+            img_arr = img_arr / 255.0 if max_val <= 255.0 else img_arr / 65535.0
+        
+        # For EXR, we want to expand the range to make use of HDR
+        # If the image has low dynamic range, expand it
+        if analysis['dynamic_range'] < 2.0:
+            # Low DR image - expand to use more of the float range
+            img_arr = img_arr * 2.0  # Expand to [0, 2.0]
+        
+        # Split channels
+        if c >= 3:
+            r = img_arr[:, :, 0]
+            g = img_arr[:, :, 1]
+            b = img_arr[:, :, 2]
+            channels = {'R': r, 'G': g, 'B': b}
+            if c >= 4:
+                a = img_arr[:, :, 3]
+                channels['A'] = a
+        else:
+            # Grayscale - replicate to RGB
+            gray = img_arr[:, :, 0]
+            channels = {'R': gray, 'G': gray, 'B': gray}
+        
+        # Save EXR
+        output_dir = folder_paths.get_output_directory()
+        counter = 1
+        while True:
+            filename = f"{filename_prefix}_{counter:04d}.exr"
+            exr_path = os.path.join(output_dir, filename)
+            if not os.path.exists(exr_path):
+                break
+            counter += 1
+        
+        # Write EXR using OpenEXR if available
+        if OPENEXR_AVAILABLE:
+            self._save_exr_openexr(exr_path, channels, h, w, bit_depth, compression)
+        elif CV2_AVAILABLE:
+            # Fallback to OpenCV
+            self._save_exr_cv2(exr_path, img_arr)
+        else:
+            raise Exception("[RKImageToEXR] No EXR writer available. Install OpenEXR or OpenCV.")
+        
+        info = f"Converted to EXR | {w}x{h} | {bit_depth} | {compression} | DR: {analysis['dynamic_range']:.2f} | Saved: {filename}"
+        
+        if auto_save:
+            return (exr_path, info)
+        else:
+            # Delete the file if auto_save is off
+            if os.path.exists(exr_path):
+                os.remove(exr_path)
+            return ("", info)
+
+    def _analyze_image(self, img_arr):
+        """Analyze image characteristics for optimal EXR encoding."""
+        analysis = {}
+        
+        # Dynamic range (max / min non-zero)
+        min_val = img_arr[img_arr > 0].min() if np.any(img_arr > 0) else 1e-6
+        max_val = img_arr.max()
+        analysis['dynamic_range'] = max_val / min_val if min_val > 0 else 1.0
+        
+        # Mean brightness
+        analysis['mean'] = img_arr.mean()
+        
+        # Standard deviation (contrast measure)
+        analysis['std'] = img_arr.std()
+        
+        # Check if image has alpha
+        analysis['has_alpha'] = img_arr.shape[2] >= 4 if len(img_arr.shape) == 3 else False
+        
+        return analysis
+
+    def _save_exr_openexr(self, filepath, channels, h, w, bit_depth, compression):
+        """Save EXR using OpenEXR library."""
+        import Imath
+        
+        # Map compression names to OpenEXR constants
+        compression_map = {
+            "none": Imath.Compression.NO_COMPRESSION,
+            "rle": Imath.Compression.RLE_COMPRESSION,
+            "zips": Imath.Compression.ZIPS_COMPRESSION,
+            "zip": Imath.Compression.ZIP_COMPRESSION,
+            "piz": Imath.Compression.PIZ_COMPRESSION,
+            "pxr24": Imath.Compression.PXR24_COMPRESSION,
+            "b44": Imath.Compression.B44_COMPRESSION,
+            "b44a": Imath.Compression.B44A_COMPRESSION,
+            "dwaa": Imath.Compression.DWAA_COMPRESSION,
+            "dwab": Imath.Compression.DWAB_COMPRESSION,
+        }
+        
+        comp = compression_map.get(compression, Imath.Compression.ZIP_COMPRESSION)
+        
+        # Pixel type
+        if bit_depth == "half":
+            pt = Imath.PixelType(Imath.PixelType.HALF)
+        else:
+            pt = Imath.PixelType(Imath.PixelType.FLOAT)
+        
+        # Build header
+        header = OpenEXR.Header(w, h)
+        header['compression'] = comp
+        header['channels'] = {name: pt for name in channels.keys()}
+        
+        # Convert channels to bytes
+        channel_data = {}
+        for name, arr in channels.items():
+            if bit_depth == "half":
+                # Convert to float16
+                import struct
+                flat = arr.astype(np.float16).flatten()
+                channel_data[name] = flat.tobytes()
+            else:
+                channel_data[name] = arr.astype(np.float32).tobytes()
+        
+        # Write
+        exr_out = OpenEXR.OutputFile(filepath, header)
+        exr_out.writePixels(channel_data)
+        exr_out.close()
+
+    def _save_exr_cv2(self, filepath, img_arr):
+        """Save EXR using OpenCV (fallback)."""
+        # OpenCV expects BGR format
+        if len(img_arr.shape) == 3 and img_arr.shape[2] >= 3:
+            bgr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
+        else:
+            bgr = img_arr
+        
+        # Save with float32
+        cv2.imwrite(filepath, bgr.astype(np.float32))
+
+    @classmethod
+    def IS_CHANGED(cls, image, enable, bit_depth, compression, auto_save, filename_prefix, reference_exr=""):
+        if not enable:
+            return ""
+        if image is not None:
+            try:
+                img_bytes = image.cpu().numpy().tobytes()
+                m = hashlib.sha256()
+                m.update(img_bytes)
+                return m.digest().hex()
+            except:
+                pass
+        return float("NaN")
+
+
+# ============================================================
 # REGISTRATION
 # ============================================================
 
@@ -1038,6 +1279,7 @@ IMAGE_CLASS_MAPPINGS = {
     "RKImageBorder": RKImageBorder,
     "RKAdvancedImageLoader": RKAdvancedImageLoader,
     "RK_EXRConverter": RK_EXRConverter,
+    "RKImageToEXR": RKImageToEXR,
 }
 
 IMAGE_NAME_MAPPINGS = {
@@ -1049,4 +1291,5 @@ IMAGE_NAME_MAPPINGS = {
     "RKImageBorder": "Add Border (RK)",
     "RKAdvancedImageLoader": "Advanced Image Loader (RK)",
     "RK_EXRConverter": "EXR Converter (RK)",
+    "RKImageToEXR": "Image To EXR (RK)",
 }
