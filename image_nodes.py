@@ -299,6 +299,7 @@ class RKAdvancedImageLoader:
     - Load any image format (PNG, JPG, WEBP, BMP, TIFF, TGA, EXR, HDR, etc.)
     - Custom folder path input - type any folder on your system
     - Frame-by-frame mode: each run outputs the next frame (frame 1, frame 2, frame 3...)
+    - Manual frame offset: set custom starting frame number
     - Batch mode: load all images from a folder matching a pattern
     - Dual output: normal IMAGE + RAW EXR output (for EXR Converter node)
     - Upload single image option
@@ -336,8 +337,10 @@ class RKAdvancedImageLoader:
                 "uploaded_image": (sorted(all_files), {"tooltip": "Select an uploaded image from ComfyUI input folder. Only used when source_type=upload_image"}),
                 "enable": ("BOOLEAN", {"default": True, "tooltip": "Enable/disable this node"}),
                 "mode": (["frame_by_frame", "batch", "single"], {"default": "frame_by_frame", "tooltip": "frame_by_frame=play one image per run, batch=load all as batch, single=load first image only"}),
-                "start_frame": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1, "tooltip": "Starting frame index (0=first image in sorted list)"}),
-                "end_frame": ("INT", {"default": -1, "min": -1, "max": 99999, "step": 1, "tooltip": "End frame index (-1=last image)"}),
+                "use_manual_frame": ("BOOLEAN", {"default": False, "tooltip": "Enable to set a custom starting frame number. When disabled, starts from frame 1 (index 0)."}),
+                "manual_frame": ("INT", {"default": 1, "min": 1, "max": 99999, "step": 1, "tooltip": "Custom starting frame number (1-based). Only used when use_manual_frame=True."}),
+                "start_frame": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1, "tooltip": "Starting file index (0=first file in sorted list)."}),
+                "end_frame": ("INT", {"default": -1, "min": -1, "max": 99999, "step": 1, "tooltip": "End file index (-1=last file)"}),
                 "step": ("INT", {"default": 1, "min": 1, "max": 100, "step": 1, "tooltip": "Skip N images (1=every image, 2=every other)"}),
                 "loop": ("BOOLEAN", {"default": True, "tooltip": "Loop back to start after last frame"}),
                 "reset": ("BOOLEAN", {"default": False, "tooltip": "Reset to start frame on next run"}),
@@ -355,7 +358,8 @@ class RKAdvancedImageLoader:
     CATEGORY = "rk_pix/image"
     FUNCTION = "load_image"
 
-    def load_image(self, source_type, folder_path, pattern, uploaded_image, enable, mode, start_frame, end_frame, step, loop, reset,
+    def load_image(self, source_type, folder_path, pattern, uploaded_image, enable, mode, use_manual_frame, manual_frame,
+                   start_frame, end_frame, step, loop, reset,
                    sort_by="name_natural", unique_id=None):
         
         if not enable:
@@ -428,8 +432,13 @@ class RKAdvancedImageLoader:
 
         total_files = len(file_list)
 
-        # Apply start/end range
-        effective_start = min(start_frame, total_files - 1)
+        # Apply manual frame offset
+        if use_manual_frame:
+            # manual_frame is 1-based, convert to 0-based index
+            effective_start = min(manual_frame - 1, total_files - 1)
+        else:
+            effective_start = min(start_frame, total_files - 1)
+        
         effective_end = end_frame if end_frame >= 0 else total_files - 1
         effective_end = min(effective_end, total_files - 1)
 
@@ -465,10 +474,11 @@ class RKAdvancedImageLoader:
             
             self._player_states[state_key] = next_idx
             
-            actual_frame_num = effective_start + (current_idx * step)
-            info = f"Frame {current_idx + 1}/{ranged_total} (File #{actual_frame_num + 1}/{total_files}) | {info_text}"
+            # Display frame number (1-based for user)
+            actual_frame_num = effective_start + (current_idx * step) + 1
+            info = f"Frame {actual_frame_num}/{total_files} (Index {current_idx + 1}/{ranged_total}) | {info_text}"
             
-            return (img_tensor, mask_tensor, raw_exr_tensor, current_idx, ranged_total, info, current_file)
+            return (img_tensor, mask_tensor, raw_exr_tensor, actual_frame_num, ranged_total, info, current_file)
         
         elif mode == "batch":
             # Batch mode: load all images
@@ -486,7 +496,7 @@ class RKAdvancedImageLoader:
             batch_masks = torch.cat(masks, dim=0)
             batch_raw = torch.cat(raw_exrs, dim=0)
             
-            info = f"Batch: {ranged_total} files | Range: {effective_start}-{effective_end} | Step: {step} | Total: {total_files}"
+            info = f"Batch: {ranged_total} files | Range: {effective_start + 1}-{effective_end + 1} | Step: {step} | Total: {total_files}"
             
             return (batch_images, batch_masks, batch_raw, 0, ranged_total, info, file_list[0] if file_list else "")
         
@@ -494,7 +504,7 @@ class RKAdvancedImageLoader:
             current_file = ranged_files[0]
             img_tensor, mask_tensor, raw_exr_tensor, info_text = self._load_file_with_raw(current_file)
             info = f"Single: {info_text}"
-            return (img_tensor, mask_tensor, raw_exr_tensor, 0, ranged_total, info, current_file)
+            return (img_tensor, mask_tensor, raw_exr_tensor, effective_start + 1, ranged_total, info, current_file)
 
     def _load_file_with_raw(self, filepath):
         """
@@ -705,7 +715,8 @@ class RKAdvancedImageLoader:
                 for text in re.split(r'([0-9]+)', s)]
 
     @classmethod
-    def IS_CHANGED(cls, source_type, folder_path, pattern, uploaded_image, enable, mode, start_frame, end_frame, step, loop, reset,
+    def IS_CHANGED(cls, source_type, folder_path, pattern, uploaded_image, enable, mode, use_manual_frame, manual_frame,
+                   start_frame, end_frame, step, loop, reset,
                    sort_by="name_natural", unique_id=None):
         if not enable:
             return ""
@@ -730,17 +741,12 @@ class RKAdvancedImageLoader:
                 return m.digest().hex()
         return float("NaN")
 
-
-# ============================================================
-# RK EXR CONVERTER - Dedicated EXR processing node
-# ============================================================
-
 class RK_EXRConverter:
     """
     Dedicated EXR converter with full color space control.
     
     Features:
-    - Load EXR images with proper float handling
+    - Accept raw EXR IMAGE tensor from Advanced Image Loader
     - Convert to PNG with configurable bit depth (8, 16, 32)
     - Color space transforms: Linear, sRGB, ACES, Custom Gamma
     - Custom LUT support (3D LUT .cube files)
@@ -752,12 +758,6 @@ class RK_EXRConverter:
     def INPUT_TYPES(cls):
         input_dir = folder_paths.get_input_directory()
         
-        exr_files = []
-        if os.path.exists(input_dir):
-            for f in sorted(os.listdir(input_dir)):
-                if f.lower().endswith('.exr'):
-                    exr_files.append(f)
-        
         # Check for LUT files
         lut_files = ["None"]
         lut_dir = os.path.join(input_dir, "luts")
@@ -768,7 +768,7 @@ class RK_EXRConverter:
         
         return {
             "required": {
-                "exr_image": (sorted(exr_files) if exr_files else [""], {"tooltip": "Select EXR file to convert"}),
+                "raw_exr": ("IMAGE", {"tooltip": "Connect raw_exr output from Advanced Image Loader here"}),
                 "enable": ("BOOLEAN", {"default": True}),
                 "color_space": (["linear", "srgb", "rec709", "aces", "custom_gamma", "custom_lut"], {"default": "linear", "tooltip": "Output color space"}),
                 "gamma": ("FLOAT", {"default": 2.2, "min": 0.1, "max": 5.0, "step": 0.01, "tooltip": "Custom gamma value (when color_space=custom_gamma)"}),
@@ -789,25 +789,20 @@ class RK_EXRConverter:
     FUNCTION = "convert_exr"
     OUTPUT_NODE = True
 
-    def convert_exr(self, exr_image, enable, color_space, gamma, exposure, tone_map,
+    def convert_exr(self, raw_exr, enable, color_space, gamma, exposure, tone_map,
                     output_depth, auto_save_png, filename_prefix, custom_lut="None"):
         
         if not enable:
             dummy = torch.zeros((1, 64, 64, 3))
             return (dummy, "[DISABLED]", "")
 
-        if not exr_image:
-            raise Exception("[RK_EXRConverter] No EXR file selected")
+        if raw_exr is None or raw_exr.shape[0] == 0:
+            raise Exception("[RK_EXRConverter] No raw EXR input connected. Connect raw_exr from Advanced Image Loader.")
 
-        input_dir = folder_paths.get_input_directory()
-        filepath = os.path.join(input_dir, exr_image)
-        
-        if not os.path.exists(filepath):
-            raise Exception(f"[RK_EXRConverter] File not found: {filepath}")
-
-        # Load EXR as float32 HDR
-        img_arr, max_val, loader_info = self._load_exr_raw(filepath)
+        # raw_exr is a torch tensor [B, H, W, 3] with float values (may be > 1)
+        img_arr = raw_exr[0].cpu().numpy().astype(np.float32)  # Take first batch item
         h, w = img_arr.shape[:2]
+        max_val = img_arr.max()
         
         # Apply exposure
         if exposure != 0:
@@ -817,6 +812,7 @@ class RK_EXRConverter:
         img_arr = self._apply_tone_map(img_arr, tone_map)
         
         # Apply color space transform
+        input_dir = folder_paths.get_input_directory()
         img_arr = self._apply_color_space(img_arr, color_space, gamma, custom_lut, input_dir)
         
         # Clip to valid range
@@ -862,57 +858,11 @@ class RK_EXRConverter:
             pil_img.save(save_path)
             saved_path = save_path
         
-        info = f"{os.path.basename(filepath)} | {w}x{h} | {loader_info} | {tone_map} tone map | {color_space} | {depth_info}"
+        info = f"EXR Convert | {w}x{h} | Max: {max_val:.4f} | {tone_map} tone map | {color_space} | {depth_info}"
         if saved_path:
             info += f" | Saved: {os.path.basename(saved_path)}"
         
         return (tensor, info, saved_path)
-
-    def _load_exr_raw(self, filepath):
-        """Load EXR and return raw float32 array + max value info."""
-        if OPENEXR_AVAILABLE:
-            exr_file = OpenEXR.InputFile(filepath)
-            header = exr_file.header()
-            dw = header['dataWindow']
-            width = dw.max.x - dw.min.x + 1
-            height = dw.max.y - dw.min.y + 1
-            
-            pt = Imath.PixelType(Imath.PixelType.FLOAT)
-            channels = header['channels'].keys()
-            
-            r_str = exr_file.channel('R', pt) if 'R' in channels else None
-            g_str = exr_file.channel('G', pt) if 'G' in channels else None
-            b_str = exr_file.channel('B', pt) if 'B' in channels else None
-            
-            if r_str is None and 'Y' in channels:
-                y_str = exr_file.channel('Y', pt)
-                y = np.frombuffer(y_str, dtype=np.float32).reshape((height, width))
-                r_str = y.tobytes()
-                g_str = y.tobytes()
-                b_str = y.tobytes()
-            
-            r = np.frombuffer(r_str, dtype=np.float32).reshape((height, width))
-            g = np.frombuffer(g_str, dtype=np.float32).reshape((height, width)) if g_str is not None else r.copy()
-            b = np.frombuffer(b_str, dtype=np.float32).reshape((height, width)) if b_str is not None else r.copy()
-            
-            img_arr = np.stack([r, g, b], axis=-1)
-            exr_file.close()
-            max_val = img_arr.max()
-            return img_arr, max_val, f"OpenEXR | Max: {max_val:.4f}"
-        
-        elif CV2_AVAILABLE:
-            img = cv2.imread(filepath, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
-            if img is None:
-                raise Exception(f"cv2 failed to load EXR: {filepath}")
-            if len(img.shape) == 3:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            else:
-                img = np.stack([img] * 3, axis=-1)
-            img_arr = img.astype(np.float32)
-            max_val = img_arr.max()
-            return img_arr, max_val, f"cv2 | Max: {max_val:.4f}"
-        else:
-            raise Exception("No EXR loader available")
 
     def _apply_tone_map(self, img_arr, tone_map):
         """Apply tone mapping to HDR image."""
@@ -1059,17 +1009,19 @@ class RK_EXRConverter:
         return lut_size, lut_array
 
     @classmethod
-    def IS_CHANGED(cls, exr_image, enable, color_space, gamma, exposure, tone_map,
+    def IS_CHANGED(cls, raw_exr, enable, color_space, gamma, exposure, tone_map,
                    output_depth, auto_save_png, filename_prefix, custom_lut="None"):
         if not enable:
             return ""
-        input_dir = folder_paths.get_input_directory()
-        filepath = os.path.join(input_dir, exr_image)
-        if os.path.exists(filepath):
-            m = hashlib.sha256()
-            with open(filepath, 'rb') as f:
-                m.update(f.read())
-            return m.digest().hex()
+        # For IMAGE input, use a hash of the tensor
+        if raw_exr is not None:
+            try:
+                img_bytes = raw_exr.cpu().numpy().tobytes()
+                m = hashlib.sha256()
+                m.update(img_bytes)
+                return m.digest().hex()
+            except:
+                pass
         return float("NaN")
 
 
