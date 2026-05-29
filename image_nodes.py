@@ -48,60 +48,62 @@ class RKImageBlend:
     
     def blend(self, image1, image2, blend_mode, opacity):
         # Ensure same size
-        h1, w1 = image1.shape[1:3]
-        h2, w2 = image2.shape[1:3]
-        
-        if h1 != h2 or w1 != w2:
+        if image1.shape != image2.shape:
             # Resize image2 to match image1
-            image2 = comfy.utils.common_upscale(
-                image2.movedim(-1, 1), w1, h1, "bilinear", "center"
-            ).movedim(1, -1)
+            h1, w1 = image1.shape[1], image1.shape[2]
+            h2, w2 = image2.shape[1], image2.shape[2]
+            if h1 != h2 or w1 != w2:
+                # Simple resize using numpy
+                from PIL import Image
+                img2_pil = Image.fromarray((image2[0].cpu().numpy() * 255).astype(np.uint8))
+                img2_pil = img2_pil.resize((w1, h1), Image.LANCZOS)
+                image2 = torch.from_numpy(np.array(img2_pil).astype(np.float32) / 255.0).unsqueeze(0)
         
-        result = image1.clone()
+        img1 = image1[0] if len(image1.shape) == 4 else image1
+        img2 = image2[0] if len(image2.shape) == 4 else image2
         
         if blend_mode == "normal":
-            result = image1 * (1 - opacity) + image2 * opacity
+            result = img1 * (1 - opacity) + img2 * opacity
         elif blend_mode == "multiply":
-            result = image1 * (1 - opacity) + (image1 * image2) * opacity
+            result = img1 * (1 - opacity) + (img1 * img2) * opacity
         elif blend_mode == "screen":
-            result = image1 * (1 - opacity) + (1 - (1 - image1) * (1 - image2)) * opacity
+            result = img1 * (1 - opacity) + (1 - (1 - img1) * (1 - img2)) * opacity
         elif blend_mode == "overlay":
-            mask = image1 < 0.5
-            overlay = torch.where(mask, 2 * image1 * image2, 1 - 2 * (1 - image1) * (1 - image2))
-            result = image1 * (1 - opacity) + overlay * opacity
+            mask = img1 < 0.5
+            overlay = torch.where(mask, 2 * img1 * img2, 1 - 2 * (1 - img1) * (1 - img2))
+            result = img1 * (1 - opacity) + overlay * opacity
         elif blend_mode == "soft_light":
-            mask = image2 < 0.5
-            soft = torch.where(mask, 2 * image1 * image2 + image1**2 * (1 - 2 * image2), 
-                             2 * image1 * (1 - image2) + torch.sqrt(image1) * (2 * image2 - 1))
-            result = image1 * (1 - opacity) + soft * opacity
+            mask = img2 < 0.5
+            soft = torch.where(mask, 2 * img1 * img2 + img1**2 * (1 - 2 * img2), 
+                              2 * img1 * (1 - img2) + torch.sqrt(img1) * (2 * img2 - 1))
+            result = img1 * (1 - opacity) + soft * opacity
         elif blend_mode == "hard_light":
-            mask = image2 < 0.5
-            hard = torch.where(mask, 2 * image1 * image2, 1 - 2 * (1 - image1) * (1 - image2))
-            result = image1 * (1 - opacity) + hard * opacity
+            mask = img2 < 0.5
+            hard = torch.where(mask, 2 * img1 * img2, 1 - 2 * (1 - img1) * (1 - img2))
+            result = img1 * (1 - opacity) + hard * opacity
         elif blend_mode == "difference":
-            result = image1 * (1 - opacity) + torch.abs(image1 - image2) * opacity
+            result = img1 * (1 - opacity) + torch.abs(img1 - img2) * opacity
         elif blend_mode == "add":
-            result = torch.clamp(image1 + image2 * opacity, 0, 1)
+            result = img1 + img2 * opacity
+            result = torch.clamp(result, 0, 1)
         elif blend_mode == "subtract":
-            result = torch.clamp(image1 - image2 * opacity, 0, 1)
+            result = img1 - img2 * opacity
+            result = torch.clamp(result, 0, 1)
         
-        return (torch.clamp(result, 0, 1),)
-
+        return (result.unsqueeze(0),)
 
 class RKImageColorAdjust:
-    """Adjust brightness, contrast, saturation, and hue of an image."""
+    """Adjust image colors: brightness, contrast, saturation, hue."""
     
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "image": ("IMAGE",),
-            },
-            "optional": {
                 "brightness": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.01}),
                 "contrast": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.01}),
                 "saturation": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.01}),
-                "gamma": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 3.0, "step": 0.01}),
+                "hue": ("FLOAT", {"default": 0.0, "min": -0.5, "max": 0.5, "step": 0.01}),
             },
         }
     
@@ -110,42 +112,36 @@ class RKImageColorAdjust:
     CATEGORY = "rk_pix/image"
     FUNCTION = "adjust"
     
-    def adjust(self, image, brightness=1.0, contrast=1.0, saturation=1.0, gamma=1.0):
-        # Process each image in batch
-        result = []
-        for img in image:
-            # Convert to PIL
-            pil_img = Image.fromarray(
-                np.clip(255.0 * img.cpu().numpy(), 0, 255).astype(np.uint8)
-            )
-            
-            # Brightness
-            if brightness != 1.0:
-                enhancer = ImageEnhance.Brightness(pil_img)
-                pil_img = enhancer.enhance(brightness)
-            
-            # Contrast
-            if contrast != 1.0:
-                enhancer = ImageEnhance.Contrast(pil_img)
-                pil_img = enhancer.enhance(contrast)
-            
-            # Saturation
-            if saturation != 1.0:
-                enhancer = ImageEnhance.Color(pil_img)
-                pil_img = enhancer.enhance(saturation)
-            
-            # Gamma
-            if gamma != 1.0:
-                arr = np.array(pil_img).astype(np.float32) / 255.0
-                arr = np.clip(arr ** (1.0 / gamma), 0, 1)
-                pil_img = Image.fromarray(np.clip(arr * 255, 0, 255).astype(np.uint8))
-            
-            # Back to tensor
-            tensor = torch.from_numpy(np.array(pil_img).astype(np.float32) / 255.0)
-            result.append(tensor)
+    def adjust(self, image, brightness, contrast, saturation, hue):
+        img = image[0] if len(image.shape) == 4 else image
+        img_np = (img.cpu().numpy() * 255).astype(np.uint8)
+        pil_img = Image.fromarray(img_np)
         
-        return (torch.stack(result),)
-
+        if brightness != 1.0:
+            enhancer = ImageEnhance.Brightness(pil_img)
+            pil_img = enhancer.enhance(brightness)
+        
+        if contrast != 1.0:
+            enhancer = ImageEnhance.Contrast(pil_img)
+            pil_img = enhancer.enhance(contrast)
+        
+        if saturation != 1.0:
+            enhancer = ImageEnhance.Color(pil_img)
+            pil_img = enhancer.enhance(saturation)
+        
+        if hue != 0.0:
+            pil_img = self._adjust_hue(pil_img, hue)
+        
+        result = np.array(pil_img).astype(np.float32) / 255.0
+        return (torch.from_numpy(result).unsqueeze(0),)
+    
+    def _adjust_hue(self, pil_img, hue_shift):
+        """Shift hue of PIL image."""
+        img_array = np.array(pil_img.convert('HSV'))
+        img_array = img_array.astype(np.float32)
+        img_array[:, :, 0] = (img_array[:, :, 0] + hue_shift * 255) % 255
+        img_array = img_array.astype(np.uint8)
+        return Image.fromarray(img_array, mode='HSV').convert('RGB')
 
 class RKImageTile:
     """Tile an image in a grid pattern."""
@@ -155,9 +151,9 @@ class RKImageTile:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "columns": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
-                "rows": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
-                "gap": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
+                "cols": ("INT", {"default": 2, "min": 1, "max": 16, "step": 1}),
+                "rows": ("INT", {"default": 2, "min": 1, "max": 16, "step": 1}),
+                "spacing": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
             },
         }
     
@@ -166,25 +162,29 @@ class RKImageTile:
     CATEGORY = "rk_pix/image"
     FUNCTION = "tile"
     
-    def tile(self, image, columns, rows, gap):
-        b, h, w, c = image.shape
+    def tile(self, image, cols, rows, spacing):
+        img = image[0] if len(image.shape) == 4 else image
+        h, w = img.shape[0], img.shape[1]
         
-        # Create output canvas
-        out_h = h * rows + gap * (rows - 1)
-        out_w = w * columns + gap * (columns - 1)
-        output = torch.ones((b, out_h, out_w, c), dtype=image.dtype, device=image.device)
+        # Create tiled image
+        tile_h = h * rows + spacing * (rows - 1)
+        tile_w = w * cols + spacing * (cols - 1)
+        
+        if spacing > 0:
+            tiled = torch.zeros((tile_h, tile_w, 3), dtype=img.dtype, device=img.device)
+        else:
+            tiled = torch.zeros((tile_h, tile_w, 3), dtype=img.dtype, device=img.device)
         
         for row in range(rows):
-            for col in range(columns):
-                y = row * (h + gap)
-                x = col * (w + gap)
-                output[:, y:y+h, x:x+w, :] = image
+            for col in range(cols):
+                y = row * (h + spacing)
+                x = col * (w + spacing)
+                tiled[y:y+h, x:x+w] = img
         
-        return (output,)
-
+        return (tiled.unsqueeze(0),)
 
 class RKImageMirror:
-    """Mirror/flip an image horizontally or vertically."""
+    """Mirror/flip image horizontally or vertically."""
     
     @classmethod
     def INPUT_TYPES(cls):
@@ -201,26 +201,29 @@ class RKImageMirror:
     FUNCTION = "mirror"
     
     def mirror(self, image, direction):
+        img = image[0] if len(image.shape) == 4 else image
+        
         if direction == "horizontal":
-            return (torch.flip(image, dims=[2]),)
+            result = torch.flip(img, dims=[1])
         elif direction == "vertical":
-            return (torch.flip(image, dims=[1]),)
-        elif direction == "both":
-            return (torch.flip(image, dims=[1, 2]),)
-
+            result = torch.flip(img, dims=[0])
+        else:  # both
+            result = torch.flip(img, dims=[0, 1])
+        
+        return (result.unsqueeze(0),)
 
 class RKImageCrop:
-    """Crop an image with percentage-based coordinates."""
+    """Crop image to specified region."""
     
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "image": ("IMAGE",),
-                "left": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "top": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "right": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "bottom": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "x": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1}),
+                "y": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1}),
+                "width": ("INT", {"default": 512, "min": 1, "max": 10000, "step": 1}),
+                "height": ("INT", {"default": 512, "min": 1, "max": 10000, "step": 1}),
             },
         }
     
@@ -229,33 +232,28 @@ class RKImageCrop:
     CATEGORY = "rk_pix/image"
     FUNCTION = "crop"
     
-    def crop(self, image, left, top, right, bottom):
-        b, h, w, c = image.shape
+    def crop(self, image, x, y, width, height):
+        img = image[0] if len(image.shape) == 4 else image
+        h, w = img.shape[0], img.shape[1]
         
-        x1 = int(left * w)
-        y1 = int(top * h)
-        x2 = int(right * w)
-        y2 = int(bottom * h)
+        x = min(x, w - 1)
+        y = min(y, h - 1)
+        width = min(width, w - x)
+        height = min(height, h - y)
         
-        # Ensure valid coordinates
-        x1 = max(0, min(x1, w))
-        y1 = max(0, min(y1, h))
-        x2 = max(x1, min(x2, w))
-        y2 = max(y1, min(y2, h))
-        
-        return (image[:, y1:y2, x1:x2, :],)
-
+        cropped = img[y:y+height, x:x+width]
+        return (cropped.unsqueeze(0),)
 
 class RKImageBorder:
-    """Add a border to an image."""
+    """Add border to image."""
     
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "image": ("IMAGE",),
-                "border_size": ("INT", {"default": 10, "min": 0, "max": 200, "step": 1}),
-                "border_color": ("STRING", {"default": "#FFFFFF"}),
+                "border_size": ("INT", {"default": 10, "min": 0, "max": 500, "step": 1}),
+                "border_color": ("STRING", {"default": "#000000", "tooltip": "Hex color like #FF0000"}),
             },
         }
     
@@ -265,30 +263,28 @@ class RKImageBorder:
     FUNCTION = "add_border"
     
     def add_border(self, image, border_size, border_color):
-        b, h, w, c = image.shape
+        img = image[0] if len(image.shape) == 4 else image
+        h, w = img.shape[0], img.shape[1]
         
-        # Parse color
+        # Parse hex color
         border_color = border_color.lstrip('#')
         r = int(border_color[0:2], 16) / 255.0
         g = int(border_color[2:4], 16) / 255.0
-        bl = int(border_color[4:6], 16) / 255.0
+        b = int(border_color[4:6], 16) / 255.0
         
-        # Create output with border
-        out_h = h + 2 * border_size
-        out_w = w + 2 * border_size
-        output = torch.ones((b, out_h, out_w, c), dtype=image.dtype, device=image.device)
-        output[:, :, :, 0] = r
-        output[:, :, :, 1] = g
-        output[:, :, :, 2] = bl
+        new_h = h + 2 * border_size
+        new_w = w + 2 * border_size
         
-        # Place original image in center
-        output[:, border_size:border_size+h, border_size:border_size+w, :] = image
+        result = torch.zeros((new_h, new_w, 3), dtype=img.dtype, device=img.device)
+        result[:, :, 0] = r
+        result[:, :, 1] = g
+        result[:, :, 2] = b
+        result[border_size:border_size+h, border_size:border_size+w] = img
         
-        return (output,)
-
+        return (result.unsqueeze(0),)
 
 # ============================================================
-# RK ADVANCED IMAGE LOADER - Universal batch/frame-by-frame loader
+# ADVANCED IMAGE LOADER
 # ============================================================
 
 class RKAdvancedImageLoader:
@@ -691,55 +687,42 @@ class RKAdvancedImageLoader:
     def _load_hdr(self, filepath):
         """Load HDR/Radiance format."""
         if CV2_AVAILABLE:
-            img = cv2.imread(filepath, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+            img = cv2.imread(filepath, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
             if img is not None:
-                if len(img.shape) == 3:
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                img_arr = img.astype(np.float32)
-                max_val = img_arr.max()
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img = img.astype(np.float32)
+                max_val = img.max()
                 if max_val > 1.0:
-                    img_arr = img_arr / (1.0 + img_arr)
-                img_arr = np.clip(img_arr, 0, 1)
-                h, w = img_arr.shape[:2]
-                tensor = torch.from_numpy(img_arr).unsqueeze(0)
+                    img = img / max_val
+                tensor = torch.from_numpy(np.clip(img, 0, 1)).unsqueeze(0)
+                h, w = img.shape[:2]
                 mask = torch.ones((1, h, w))
-                info = f"{os.path.basename(filepath)} | {w}x{h} | HDR | Max: {max_val:.4f}"
+                info = f"{os.path.basename(filepath)} | {w}x{h} | HDR"
                 return (tensor, mask, info)
         
+        # Fallback: try as regular image
         return self._load_standard(filepath)
 
     def _natural_sort_key(self, s):
         """Natural sort key for filenames like frame_001, frame_002."""
         import re
         return [int(text) if text.isdigit() else text.lower() 
-                for text in re.split(r'([0-9]+)', s)]
+                for text in re.split('([0-9]+)', s)]
 
     @classmethod
-    def IS_CHANGED(cls, source_type, folder_path, pattern, uploaded_image, enable, mode, use_manual_frame, manual_frame,
-                   start_frame, end_frame, step, loop, reset,
+    def IS_CHANGED(cls, source_type, folder_path, pattern, uploaded_image, enable, mode, 
+                   use_manual_frame, manual_frame, start_frame, end_frame, step, loop, reset,
                    sort_by="name_natural", unique_id=None):
         if not enable:
             return ""
         if source_type == "upload_image":
-            input_dir = folder_paths.get_input_directory()
-            filepath = os.path.join(input_dir, uploaded_image)
-            if os.path.exists(filepath):
-                m = hashlib.sha256()
-                with open(filepath, 'rb') as f:
-                    m.update(f.read())
-                return m.digest().hex()
-            return float("NaN")
-        # folder_path mode
-        if mode == "frame_by_frame":
-            return float("NaN")
-        if folder_path and folder_path.strip():
-            folder = os.path.normpath(folder_path.strip())
-            if os.path.exists(folder) and os.path.isdir(folder):
-                m = hashlib.sha256()
-                for f in sorted(os.listdir(folder))[:50]:
-                    m.update(f.encode())
-                return m.digest().hex()
+            return uploaded_image
         return float("NaN")
+
+
+# ============================================================
+# EXR CONVERTER NODE
+# ============================================================
 
 class RK_EXRConverter:
     """
@@ -1068,7 +1051,7 @@ class RK_EXRConverter:
 
 class RKImageToEXR:
     """
-    Convert any image to EXR format with deep reference EXR analysis.
+    Convert any processed image back to EXR format with deep reference EXR analysis.
     
     Workflow:
     1. Load EXR -> EXR Converter (color space, tone map) -> IMAGE
@@ -1076,11 +1059,12 @@ class RKImageToEXR:
     3. Output EXR matches original raw EXR characteristics
     
     Features:
-    - Analyzes reference EXR to copy: data range, gamma, linearity
-    - Auto-detects if reference is linear or sRGB
-    - Reverses tone mapping to restore HDR range
+    - Analyzes reference EXR to copy: data range, gamma, linearity, color space
+    - Auto-detects if reference is sRGB, linear, ACES, or HDR
+    - Reverses tone mapping and color space to restore HDR range
     - Preserves original EXR bit depth and compression
     - Dual preview: original input + converted EXR preview
+    - Detailed info output with all detected characteristics
     """
 
     @classmethod
@@ -1095,7 +1079,7 @@ class RKImageToEXR:
                 "auto_increment": ("BOOLEAN", {"default": True, "tooltip": "Auto-number if file exists"}),
             },
             "optional": {
-                "reference_exr": ("IMAGE", {"tooltip": "CRITICAL: Connect original raw EXR here to copy its data characteristics (range, gamma, linearity)"}),
+                "reference_exr": ("IMAGE", {"tooltip": "CRITICAL: Connect original raw EXR here to copy its data characteristics (range, gamma, linearity, color space)"}),
             },
         }
 
@@ -1158,27 +1142,29 @@ class RKImageToEXR:
             
             # Step 2: Apply reference-based transformations
             if ref_analysis is not None:
-                # Reverse gamma if reference was sRGB-like
-                if ref_analysis.get('is_srgb', False):
-                    img_arr = self._reverse_srgb(img_arr)
+                ref_type = ref_analysis.get('type', 'unknown')
+                ref_max = ref_analysis.get('max_val', 1.0)
+                
+                # ALWAYS reverse sRGB if the processed image is in sRGB space
+                # The input image from EXR Converter is typically sRGB-encoded
+                # We need to get back to linear before scaling to HDR range
+                img_arr = self._reverse_srgb(img_arr)
                 
                 # Scale to match reference data range
-                ref_max = ref_analysis.get('max_val', 1.0)
                 if ref_max > 1.0:
                     current_max = max(img_arr.max(), 1e-6)
-                    # Don't over-scale if already in HDR range
-                    if current_max <= 1.0:
-                        scale = ref_max / current_max
-                        img_arr = img_arr * scale
-                    else:
-                        # Already HDR, just ensure we hit the target max
-                        scale = ref_max / current_max
-                        if scale > 1.0:
-                            img_arr = img_arr * scale
+                    scale = ref_max / current_max
+                    img_arr = img_arr * scale
+                elif ref_max > 0.5:
+                    # Reference max is around 0.5-1.0, likely already normalized
+                    # Just ensure we don't lose the range
+                    pass
                 
                 bit_depth = ref_analysis.get('bit_depth', 'half')
                 compression = ref_analysis.get('compression', 'zip')
             else:
+                # No reference - assume input is sRGB, convert to linear
+                img_arr = self._reverse_srgb(img_arr)
                 bit_depth = 'half'
                 compression = 'zip'
             
@@ -1213,16 +1199,8 @@ class RKImageToEXR:
             exr_preview_arr = self._tonemap_for_preview(img_arr)
             exr_preview = torch.from_numpy(exr_preview_arr.astype(np.float32)).unsqueeze(0)
             
-            # Build info
-            info = f"ImageToEXR | {w}x{h}"
-            if ref_analysis:
-                info += f" | Ref max: {ref_analysis.get('max_val', 1.0):.4f}"
-                info += f" | sRGB: {ref_analysis.get('is_srgb', False)}"
-                info += f" | Depth: {bit_depth}"
-            if saved_name:
-                info += f" | Saved: {saved_name}"
-            else:
-                info += " | Preview only"
+            # Build detailed info
+            info = self._build_info(w, h, ref_analysis, bit_depth, saved_name)
             
             return (original_preview, exr_preview, info)
             
@@ -1239,7 +1217,10 @@ class RKImageToEXR:
                 return (dummy, dummy, f"[ERROR] {str(e)}")
 
     def _analyze_reference(self, reference_exr):
-        """Deep analysis of reference EXR to extract all characteristics."""
+        """
+        Deep analysis of reference EXR to extract all characteristics.
+        Detects: sRGB, linear, ACES, HDR, and estimates color space.
+        """
         ref = reference_exr[0] if len(reference_exr.shape) == 4 else reference_exr
         ref_arr = np.array(ref.cpu().numpy(), dtype=np.float32, copy=True)
         
@@ -1248,22 +1229,72 @@ class RKImageToEXR:
         analysis['min_val'] = float(ref_arr.min())
         analysis['mean'] = float(ref_arr.mean())
         analysis['std'] = float(ref_arr.std())
+        analysis['median'] = float(np.median(ref_arr))
+        analysis['p99'] = float(np.percentile(ref_arr, 99))
         
-        # Detect if reference is sRGB-like or linear
-        # Key insight: sRGB images have max around 1.0 with gamma curve
-        # Linear HDR has max >> 1.0 or very different distribution
-        if analysis['max_val'] <= 1.05:
-            # Low range - likely sRGB/gamma encoded
+        # Analyze histogram distribution to detect color space
+        flat = ref_arr.flatten()
+        
+        # Count values in different ranges
+        count_0_to_1 = np.sum((flat >= 0) & (flat <= 1.0))
+        count_1_to_2 = np.sum((flat > 1.0) & (flat <= 2.0))
+        count_above_2 = np.sum(flat > 2.0)
+        count_negative = np.sum(flat < 0)
+        total = len(flat)
+        
+        analysis['pct_0_1'] = count_0_to_1 / total * 100
+        analysis['pct_1_2'] = count_1_to_2 / total * 100
+        analysis['pct_above_2'] = count_above_2 / total * 100
+        analysis['pct_negative'] = count_negative / total * 100
+        
+        # Detect color space type based on distribution
+        max_val = analysis['max_val']
+        mean_val = analysis['mean']
+        std_val = analysis['std']
+        
+        # ACES detection: values typically 0-2, mean around 0.3-0.6, some values >1 but not extreme
+        is_aces = (0.5 < max_val < 5.0 and 
+                   0.1 < mean_val < 0.8 and 
+                   0.1 < std_val < 0.5 and
+                   count_above_2 < total * 0.1)
+        
+        # sRGB detection: most values 0-1, max around 1.0, mean lower
+        is_srgb = (max_val <= 1.05 and 
+                   count_0_to_1 > total * 0.95)
+        
+        # HDR detection: significant values > 1.0, possibly very high max
+        is_hdr = (max_val > 5.0 or count_above_2 > total * 0.05)
+        
+        # Linear low-range: max around 0.5-1.0, but not sRGB-shaped
+        is_linear_low = (0.5 < max_val <= 2.0 and 
+                         not is_srgb and 
+                         not is_aces)
+        
+        if is_aces:
+            analysis['type'] = 'aces'
+            analysis['is_srgb'] = False
+            analysis['bit_depth'] = 'half'
+            analysis['color_space'] = 'ACES2065-1/ACEScg'
+        elif is_srgb:
+            analysis['type'] = 'srgb'
             analysis['is_srgb'] = True
             analysis['bit_depth'] = 'half'
-        elif analysis['max_val'] > 1.05 and analysis['max_val'] < 2.0:
-            # Could be linear with slight over-bright
+            analysis['color_space'] = 'sRGB'
+        elif is_hdr:
+            analysis['type'] = 'hdr'
+            analysis['is_srgb'] = False
+            analysis['bit_depth'] = 'float' if max_val > 10.0 else 'half'
+            analysis['color_space'] = 'Linear HDR'
+        elif is_linear_low:
+            analysis['type'] = 'linear'
             analysis['is_srgb'] = False
             analysis['bit_depth'] = 'half'
+            analysis['color_space'] = 'Linear'
         else:
-            # True HDR linear
+            analysis['type'] = 'unknown'
             analysis['is_srgb'] = False
-            analysis['bit_depth'] = 'float' if analysis['max_val'] > 10.0 else 'half'
+            analysis['bit_depth'] = 'half'
+            analysis['color_space'] = 'Unknown'
         
         analysis['compression'] = 'zip'
         return analysis
@@ -1278,28 +1309,40 @@ class RKImageToEXR:
 
     def _tonemap_for_preview(self, img_arr):
         """Proper HDR to LDR tonemapping for preview."""
-        # Make a copy
         preview = img_arr.copy()
-        
-        # Handle different ranges
         max_val = preview.max()
         
         if max_val <= 1.0:
-            # Already LDR, just clip
             return np.clip(preview, 0, 1)
         
-        # For HDR, use a better tonemapping than simple x/(1+x)
-        # Use a modified Reinhard that preserves more detail
-        
-        # Method: Scale by log to compress dynamic range
-        # log(1 + x) / log(1 + max) gives better distribution
+        # For HDR, use log-based compression for better distribution
         log_max = np.log(1 + max_val)
         preview = np.log(1 + preview) / log_max
-        
-        # Apply slight contrast boost
         preview = np.clip(preview * 1.2, 0, 1)
         
         return preview.astype(np.float32)
+
+    def _build_info(self, w, h, ref_analysis, bit_depth, saved_name):
+        """Build detailed info string."""
+        info_parts = [f"ImageToEXR | {w}x{h}"]
+        
+        if ref_analysis:
+            info_parts.append(f"Type: {ref_analysis.get('type', 'unknown').upper()}")
+            info_parts.append(f"ColorSpace: {ref_analysis.get('color_space', 'Unknown')}")
+            info_parts.append(f"Range: {ref_analysis.get('min_val', 0):.4f} - {ref_analysis.get('max_val', 1):.4f}")
+            info_parts.append(f"Mean: {ref_analysis.get('mean', 0):.4f} | Std: {ref_analysis.get('std', 0):.4f}")
+            info_parts.append(f"Median: {ref_analysis.get('median', 0):.4f} | P99: {ref_analysis.get('p99', 0):.4f}")
+            info_parts.append(f"Distribution: {ref_analysis.get('pct_0_1', 0):.1f}% in [0,1], {ref_analysis.get('pct_above_2', 0):.1f}% >2")
+            info_parts.append(f"Depth: {bit_depth} | sRGB: {ref_analysis.get('is_srgb', False)}")
+        else:
+            info_parts.append("No reference - using defaults (linear, half)")
+        
+        if saved_name:
+            info_parts.append(f"Saved: {saved_name}")
+        else:
+            info_parts.append("Preview only")
+        
+        return " | ".join(info_parts)
 
     def _get_output_dir(self, save_path):
         """Determine output directory."""
