@@ -1413,6 +1413,10 @@ class RKImageToEXR:
             # Instead, we scale the processed image to match the original raw data range.
             # This works for ALL EXR types universally.
             
+            # DEBUG: Print input statistics
+            print(f"[RKImageToEXR DEBUG] Input shape: {img_arr.shape}, dtype: {img_arr.dtype}")
+            print(f"[RKImageToEXR DEBUG] Input min: {img_arr.min():.6f}, max: {img_arr.max():.6f}, mean: {img_arr.mean():.6f}")
+            
             # Step 1: Normalize input to [0,1] range
             current_max = img_arr.max()
             if current_max > 1.0:
@@ -1421,6 +1425,7 @@ class RKImageToEXR:
                 else:
                     img_arr = img_arr / 65535.0
                 current_max = img_arr.max()
+                print(f"[RKImageToEXR DEBUG] Normalized by {255.0 if current_max <= 255.0 else 65535.0}")
             
             # Step 2: Get target range from exr_data or reference
             target_max = 1.0
@@ -1450,6 +1455,8 @@ class RKImageToEXR:
             # Step 3: Scale to match original range
             # When preserve_exr was used, the converter did linear scaling (divide by max)
             # So we just multiply by original_max - PERFECT reversal!
+            print(f"[RKImageToEXR DEBUG] preserve_mode={preserve_mode}, current_max={current_max:.6f}, target_max={target_max:.6f}")
+            
             if preserve_mode:
                 # PERFECT round-trip: linear scale was used in converter
                 # img_converter = raw / raw_max
@@ -1457,6 +1464,7 @@ class RKImageToEXR:
                 scale = target_max / max(current_max, 1e-6)
                 img_arr = img_arr * scale
                 source_info += " | PERFECT (linear_scale)"
+                print(f"[RKImageToEXR DEBUG] PERFECT mode: scale={scale:.6f}")
             else:
                 # DISPLAY mode: non-linear tone mapping was used
                 # We can only approximate by matching the range
@@ -1466,6 +1474,8 @@ class RKImageToEXR:
                     source_info += " | APPROX (tone_mapped)"
                 elif target_max <= 1.0 and current_max > 1.0:
                     img_arr = np.clip(img_arr, 0, target_max)
+            
+            print(f"[RKImageToEXR DEBUG] After scaling: min={img_arr.min():.6f}, max={img_arr.max():.6f}, mean={img_arr.mean():.6f}")
             
             # Handle negative values if original had them
             if target_min < 0:
