@@ -1114,108 +1114,134 @@ class RKImageToEXR:
         if image is None or image.shape[0] == 0:
             raise Exception("[RKImageToEXR] No image input provided")
 
-        # Get input image data
-        img_tensor = image[0] if len(image.shape) == 4 else image
-        h, w, c = img_tensor.shape
-        img_arr = img_tensor.cpu().numpy().astype(np.float32)
-        
-        # Store original for preview
-        original_arr = img_arr.copy()
-        
-        # Normalize original for preview
-        orig_max = original_arr.max()
-        if orig_max > 1.0:
-            original_preview_arr = original_arr / 255.0 if orig_max <= 255.0 else original_arr / 65535.0
-        else:
-            original_preview_arr = original_arr.copy()
-        original_preview_arr = np.clip(original_preview_arr, 0, 1)
-        original_preview = torch.from_numpy(original_preview_arr.astype(np.float32)).unsqueeze(0)
-        
-        # Analyze reference EXR if provided
-        ref_analysis = self._analyze_reference(reference_exr) if reference_exr is not None else None
-        
-        # Normalize input to [0,1] if needed for processing
-        max_val = img_arr.max()
-        if max_val > 1.0:
-            img_arr = img_arr / 255.0 if max_val <= 255.0 else img_arr / 65535.0
-        
-        # === CORE LOGIC: Match reference EXR characteristics ===
-        if ref_analysis is not None:
-            # Reference EXR provided - copy its characteristics
+        try:
+            # Get input image data - make a proper copy
+            if len(image.shape) == 4:
+                img_tensor = image[0].clone()
+            else:
+                img_tensor = image.clone()
             
-            # 1. Reverse gamma if reference was sRGB-like
-            if ref_analysis['is_srgb']:
-                img_arr = self._reverse_srgb(img_arr)
+            h, w, c = img_tensor.shape
             
-            # 2. Reverse tone mapping to restore HDR range
-            if ref_analysis['max_val'] > 1.0:
-                img_arr = self._reverse_tonemap(img_arr, ref_analysis['max_val'])
+            # Convert to numpy with explicit copy
+            img_arr = np.array(img_tensor.cpu().numpy(), dtype=np.float32, copy=True)
             
-            # 3. Scale to match reference data range
-            if ref_analysis['max_val'] > 1.0:
-                target_max = ref_analysis['max_val']
-                current_max = max(img_arr.max(), 1e-6)
-                scale = target_max / current_max
-                img_arr = img_arr * scale
+            # Store original for preview (before any modifications)
+            original_arr = img_arr.copy()
             
-            bit_depth = ref_analysis['bit_depth']
-            compression = ref_analysis['compression']
-        else:
-            # No reference - use defaults
-            bit_depth = "half"
-            compression = "zip"
-        
-        # Build channels
-        if c >= 3:
-            channels = {'R': img_arr[:, :, 0], 'G': img_arr[:, :, 1], 'B': img_arr[:, :, 2]}
-            if c >= 4:
-                channels['A'] = img_arr[:, :, 3]
-        else:
-            gray = img_arr[:, :, 0]
-            channels = {'R': gray, 'G': gray, 'B': gray}
-        
-        # Save EXR if enabled
-        saved_name = ""
-        if save_exr:
-            output_dir = self._get_output_dir(save_path)
-            exr_path, fname = self._build_filename(output_dir, filename, auto_increment)
+            # Create original preview (normalize to [0,1] for display)
+            orig_max = original_arr.max()
+            if orig_max > 1.0:
+                if orig_max <= 255.0:
+                    original_preview_arr = original_arr / 255.0
+                else:
+                    original_preview_arr = original_arr / 65535.0
+            else:
+                original_preview_arr = original_arr.copy()
+            original_preview_arr = np.clip(original_preview_arr, 0, 1)
+            original_preview = torch.from_numpy(original_preview_arr.astype(np.float32)).unsqueeze(0)
             
-            try:
+            # Analyze reference EXR if provided
+            ref_analysis = None
+            if reference_exr is not None and reference_exr.shape[0] > 0:
+                ref_analysis = self._analyze_reference(reference_exr)
+            
+            # === PROCESS IMAGE FOR EXR CONVERSION ===
+            
+            # Step 1: Normalize input to [0,1]
+            max_val = img_arr.max()
+            if max_val > 1.0:
+                if max_val <= 255.0:
+                    img_arr = img_arr / 255.0
+                else:
+                    img_arr = img_arr / 65535.0
+            
+            # Step 2: Apply reference-based transformations
+            if ref_analysis is not None:
+                # Reverse gamma if reference was sRGB-like
+                if ref_analysis.get('is_srgb', False):
+                    img_arr = self._reverse_srgb(img_arr)
+                
+                # Scale to match reference data range
+                ref_max = ref_analysis.get('max_val', 1.0)
+                if ref_max > 1.0:
+                    current_max = max(img_arr.max(), 1e-6)
+                    # Don't over-scale if already in HDR range
+                    if current_max <= 1.0:
+                        scale = ref_max / current_max
+                        img_arr = img_arr * scale
+                    else:
+                        # Already HDR, just ensure we hit the target max
+                        scale = ref_max / current_max
+                        if scale > 1.0:
+                            img_arr = img_arr * scale
+                
+                bit_depth = ref_analysis.get('bit_depth', 'half')
+                compression = ref_analysis.get('compression', 'zip')
+            else:
+                bit_depth = 'half'
+                compression = 'zip'
+            
+            # Step 3: Build channels for EXR
+            if c >= 3:
+                channels = {
+                    'R': np.array(img_arr[:, :, 0], copy=True),
+                    'G': np.array(img_arr[:, :, 1], copy=True),
+                    'B': np.array(img_arr[:, :, 2], copy=True)
+                }
+                if c >= 4:
+                    channels['A'] = np.array(img_arr[:, :, 3], copy=True)
+            else:
+                gray = np.array(img_arr[:, :, 0], copy=True)
+                channels = {'R': gray, 'G': gray.copy(), 'B': gray.copy()}
+            
+            # Step 4: Save EXR if enabled
+            saved_name = ""
+            if save_exr:
+                output_dir = self._get_output_dir(save_path)
+                exr_path, fname = self._build_filename(output_dir, filename, auto_increment)
+                
                 if OPENEXR_AVAILABLE:
                     self._save_exr_openexr(exr_path, channels, h, w, bit_depth, compression)
                 elif CV2_AVAILABLE:
                     self._save_exr_cv2(exr_path, img_arr)
                 else:
-                    raise Exception("No EXR writer available")
+                    raise Exception("No EXR writer available. Install OpenEXR or OpenCV.")
                 saved_name = fname
-            except Exception as e:
+            
+            # Step 5: Create EXR preview with proper HDR tonemapping
+            exr_preview_arr = self._tonemap_for_preview(img_arr)
+            exr_preview = torch.from_numpy(exr_preview_arr.astype(np.float32)).unsqueeze(0)
+            
+            # Build info
+            info = f"ImageToEXR | {w}x{h}"
+            if ref_analysis:
+                info += f" | Ref max: {ref_analysis.get('max_val', 1.0):.4f}"
+                info += f" | sRGB: {ref_analysis.get('is_srgb', False)}"
+                info += f" | Depth: {bit_depth}"
+            if saved_name:
+                info += f" | Saved: {saved_name}"
+            else:
+                info += " | Preview only"
+            
+            return (original_preview, exr_preview, info)
+            
+        except Exception as e:
+            # On error, return the original image as preview so user sees something
+            try:
+                if len(image.shape) == 4:
+                    err_preview = image[0:1]
+                else:
+                    err_preview = image.unsqueeze(0) if len(image.shape) == 3 else image
+                return (err_preview, err_preview, f"[ERROR] {str(e)}")
+            except:
                 dummy = torch.zeros((1, 64, 64, 3))
-                return (original_preview, dummy, f"[SAVE ERROR] {str(e)}")
-        
-        # Create EXR preview (tonemapped for display)
-        exr_preview_arr = img_arr.copy()
-        if exr_preview_arr.max() > 1.0:
-            exr_preview_arr = exr_preview_arr / (1.0 + exr_preview_arr)
-        exr_preview_arr = np.clip(exr_preview_arr, 0, 1)
-        exr_preview = torch.from_numpy(exr_preview_arr.astype(np.float32)).unsqueeze(0)
-        
-        # Build info
-        info = f"ImageToEXR | {w}x{h}"
-        if ref_analysis:
-            info += f" | Ref max: {ref_analysis['max_val']:.4f}"
-            info += f" | sRGB: {ref_analysis['is_srgb']}"
-            info += f" | Depth: {bit_depth}"
-        if saved_name:
-            info += f" | Saved: {saved_name}"
-        else:
-            info += " | Preview only"
-        
-        return (original_preview, exr_preview, info)
+                return (dummy, dummy, f"[ERROR] {str(e)}")
 
     def _analyze_reference(self, reference_exr):
         """Deep analysis of reference EXR to extract all characteristics."""
         ref = reference_exr[0] if len(reference_exr.shape) == 4 else reference_exr
-        ref_arr = ref.cpu().numpy().astype(np.float32)
+        ref_arr = np.array(ref.cpu().numpy(), dtype=np.float32, copy=True)
         
         analysis = {}
         analysis['max_val'] = float(ref_arr.max())
@@ -1224,35 +1250,56 @@ class RKImageToEXR:
         analysis['std'] = float(ref_arr.std())
         
         # Detect if reference is sRGB-like or linear
-        if analysis['max_val'] <= 1.0:
+        # Key insight: sRGB images have max around 1.0 with gamma curve
+        # Linear HDR has max >> 1.0 or very different distribution
+        if analysis['max_val'] <= 1.05:
+            # Low range - likely sRGB/gamma encoded
             analysis['is_srgb'] = True
-            analysis['bit_depth'] = "half"
+            analysis['bit_depth'] = 'half'
+        elif analysis['max_val'] > 1.05 and analysis['max_val'] < 2.0:
+            # Could be linear with slight over-bright
+            analysis['is_srgb'] = False
+            analysis['bit_depth'] = 'half'
         else:
-            if analysis['mean'] / analysis['max_val'] < 0.1:
-                analysis['is_srgb'] = False
-            else:
-                analysis['is_srgb'] = True
-            analysis['bit_depth'] = "half" if analysis['max_val'] < 10.0 else "float"
+            # True HDR linear
+            analysis['is_srgb'] = False
+            analysis['bit_depth'] = 'float' if analysis['max_val'] > 10.0 else 'half'
         
-        analysis['compression'] = "zip"
+        analysis['compression'] = 'zip'
         return analysis
 
     def _reverse_srgb(self, img_arr):
         """Reverse sRGB gamma to get linear values."""
+        # Protect against out-of-range values
+        img_arr = np.clip(img_arr, 0, 1)
         mask = img_arr <= 0.04045
         linear = np.where(mask, img_arr / 12.92, ((img_arr + 0.055) / 1.055) ** 2.4)
         return linear
 
-    def _reverse_tonemap(self, img_arr, ref_max):
-        """Reverse simple tone mapping to expand HDR range."""
-        if ref_max <= 1.0:
-            return img_arr
+    def _tonemap_for_preview(self, img_arr):
+        """Proper HDR to LDR tonemapping for preview."""
+        # Make a copy
+        preview = img_arr.copy()
         
-        current_max = max(img_arr.max(), 1e-6)
-        if current_max < 1.0:
-            img_arr = img_arr * ref_max
+        # Handle different ranges
+        max_val = preview.max()
         
-        return img_arr
+        if max_val <= 1.0:
+            # Already LDR, just clip
+            return np.clip(preview, 0, 1)
+        
+        # For HDR, use a better tonemapping than simple x/(1+x)
+        # Use a modified Reinhard that preserves more detail
+        
+        # Method: Scale by log to compress dynamic range
+        # log(1 + x) / log(1 + max) gives better distribution
+        log_max = np.log(1 + max_val)
+        preview = np.log(1 + preview) / log_max
+        
+        # Apply slight contrast boost
+        preview = np.clip(preview * 1.2, 0, 1)
+        
+        return preview.astype(np.float32)
 
     def _get_output_dir(self, save_path):
         """Determine output directory."""
