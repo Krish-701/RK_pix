@@ -24,76 +24,6 @@ except ImportError:
     OPENEXR_AVAILABLE = False
 
 # ============================================================
-# EXR METADATA HELPER CLASS - Range Preservation Pipeline
-# ============================================================
-
-class RK_EXRData:
-    """
-    Holds EXR metadata for universal range preservation.
-    
-    Core principle: Instead of trying to reverse tone mapping (which is lossy),
-    we preserve the original raw data range and scale the processed image
-    to match that range. This works for ALL EXR types universally.
-    
-    Pipeline:
-    1. Advanced Loader reads EXR -> stores original max_val, min_val, etc.
-    2. EXR Converter processes for display -> passes exr_data through
-    3. Image To EXR scales processed image: img * (original_max / current_max)
-    """
-    def __init__(self):
-        # File identification
-        self.source_type = "unknown"       # "exr", "hdr", "png", "jpg", "tiff", etc.
-        self.filepath = ""
-        self.file_size = 0
-        
-        # Original raw pixel statistics (CRITICAL for reconstruction)
-        self.raw_max = 1.0                 # Original maximum value
-        self.raw_min = 0.0                 # Original minimum value
-        self.raw_mean = 0.0                # Original mean
-        self.raw_median = 0.0              # Original median
-        self.raw_p99 = 0.0                 # 99th percentile
-        self.raw_std = 0.0                 # Standard deviation
-        
-        # Image dimensions
-        self.width = 0
-        self.height = 0
-        self.channels = 3
-        self.has_alpha = False
-        
-        # EXR-specific properties
-        self.bit_depth = "half"            # "half", "float", "8bit", "16bit"
-        self.compression = "zip"           # EXR compression
-        self.color_space = "unknown"       # Detected or from metadata
-        
-        # Full EXR header metadata (when available)
-        self.exr_header = {}               # Raw header attributes as strings
-        
-        # Processing info (for display only, not used for reversal)
-        self.processed_tone_map = "none"
-        self.processed_color_space = "linear"
-        self.processed_exposure = 0.0
-        
-    def to_dict(self):
-        """Serialize to dictionary for ComfyUI DICT type."""
-        return {k: v for k, v in self.__dict__.items()}
-    
-    @classmethod
-    def from_dict(cls, d):
-        """Deserialize from dictionary."""
-        obj = cls()
-        for k, v in d.items():
-            if hasattr(obj, k):
-                setattr(obj, k, v)
-        return obj
-    
-    def copy(self):
-        """Create a deep copy."""
-        return self.from_dict(self.to_dict())
-    
-    def __repr__(self):
-        return f"RK_EXRData({self.source_type}, max={self.raw_max:.4f}, cs={self.color_space})"
-
-# ============================================================
 # IMAGE PROCESSING NODES
 # ============================================================
 
@@ -419,8 +349,8 @@ class RKAdvancedImageLoader:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "DICT", "INT", "INT", "STRING", "STRING")
-    RETURN_NAMES = ("image", "mask", "raw_exr", "exr_data", "current_frame", "total_frames", "info", "filepath")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "INT", "INT", "STRING", "STRING")
+    RETURN_NAMES = ("image", "mask", "raw_exr", "current_frame", "total_frames", "info", "filepath")
     CATEGORY = "rk_pix/image"
     FUNCTION = "load_image"
 
@@ -431,8 +361,7 @@ class RKAdvancedImageLoader:
         if not enable:
             dummy = torch.zeros((1, 64, 64, 3))
             mask = torch.zeros((1, 64, 64))
-            empty_data = RK_EXRData().to_dict()
-            return (dummy, mask, dummy, empty_data, 0, 0, "[DISABLED] Node is off", "")
+            return (dummy, mask, dummy, 0, 0, "[DISABLED] Node is off", "")
 
         # === UPLOAD IMAGE MODE ===
         if source_type == "upload_image":
@@ -442,9 +371,9 @@ class RKAdvancedImageLoader:
             if not os.path.exists(filepath):
                 raise Exception(f"[RKAdvancedImageLoader] Uploaded image not found: {filepath}")
             
-            img_tensor, mask_tensor, raw_exr_tensor, exr_data, info_text = self._load_file_with_raw(filepath)
+            img_tensor, mask_tensor, raw_exr_tensor, info_text = self._load_file_with_raw(filepath)
             info = f"Uploaded: {info_text}"
-            return (img_tensor, mask_tensor, raw_exr_tensor, exr_data, 0, 1, info, filepath)
+            return (img_tensor, mask_tensor, raw_exr_tensor, 0, 1, info, filepath)
 
         # === FOLDER PATH MODE ===
         # Validate folder path
@@ -529,7 +458,7 @@ class RKAdvancedImageLoader:
                 current_idx = self._player_states[state_key] % ranged_total
             
             current_file = ranged_files[current_idx]
-            img_tensor, mask_tensor, raw_exr_tensor, exr_data, info_text = self._load_file_with_raw(current_file)
+            img_tensor, mask_tensor, raw_exr_tensor, info_text = self._load_file_with_raw(current_file)
             
             # Calculate next index
             next_idx = current_idx + 1
@@ -545,43 +474,39 @@ class RKAdvancedImageLoader:
             actual_frame_num = effective_start + (current_idx * step) + 1
             info = f"Frame {actual_frame_num}/{total_files} (Index {current_idx + 1}/{ranged_total}) | {info_text}"
             
-            return (img_tensor, mask_tensor, raw_exr_tensor, exr_data, actual_frame_num, ranged_total, info, current_file)
+            return (img_tensor, mask_tensor, raw_exr_tensor, actual_frame_num, ranged_total, info, current_file)
         
         elif mode == "batch":
             # Batch mode: load all images
             images = []
             masks = []
             raw_exrs = []
-            exr_data_list = []
             
             for fpath in ranged_files:
-                img_tensor, mask_tensor, raw_exr_tensor, exr_data, _ = self._load_file_with_raw(fpath)
+                img_tensor, mask_tensor, raw_exr_tensor, _ = self._load_file_with_raw(fpath)
                 images.append(img_tensor)
                 masks.append(mask_tensor)
                 raw_exrs.append(raw_exr_tensor)
-                exr_data_list.append(exr_data)
             
             batch_images = torch.cat(images, dim=0)
             batch_masks = torch.cat(masks, dim=0)
             batch_raw = torch.cat(raw_exrs, dim=0)
-            # Use first file's exr_data for batch
-            batch_exr_data = exr_data_list[0] if exr_data_list else RK_EXRData().to_dict()
             
             info = f"Batch: {ranged_total} files | Range: {effective_start + 1}-{effective_end + 1} | Step: {step} | Total: {total_files}"
             
-            return (batch_images, batch_masks, batch_raw, batch_exr_data, 0, ranged_total, info, file_list[0] if file_list else "")
+            return (batch_images, batch_masks, batch_raw, 0, ranged_total, info, file_list[0] if file_list else "")
         
         else:  # single mode
             current_file = ranged_files[0]
-            img_tensor, mask_tensor, raw_exr_tensor, exr_data, info_text = self._load_file_with_raw(current_file)
+            img_tensor, mask_tensor, raw_exr_tensor, info_text = self._load_file_with_raw(current_file)
             info = f"Single: {info_text}"
-            return (img_tensor, mask_tensor, raw_exr_tensor, exr_data, effective_start + 1, ranged_total, info, current_file)
+            return (img_tensor, mask_tensor, raw_exr_tensor, effective_start + 1, ranged_total, info, current_file)
 
     def _load_file_with_raw(self, filepath):
         """
         Load a file and return both processed image AND raw EXR data.
-        For EXR: returns (tonemapped_image, mask, raw_float_exr, exr_data_dict, info)
-        For others: returns (image, mask, same_image_as_raw, exr_data_dict, info)
+        For EXR: returns (tonemapped_image, mask, raw_float_exr, info)
+        For others: returns (image, mask, same_image_as_raw, info)
         """
         ext = os.path.splitext(filepath)[1].lower()
         
@@ -589,34 +514,10 @@ class RKAdvancedImageLoader:
             return self._load_exr_dual(filepath)
         elif ext in ('.hdr', '.pic'):
             img, mask, info = self._load_hdr(filepath)
-            exr_data = RK_EXRData()
-            exr_data.source_type = "hdr"
-            exr_data.color_space = "Linear HDR"
-            exr_data.filepath = filepath
-            exr_data.file_size = os.path.getsize(filepath)
-            if img.numel() > 0:
-                arr = img[0].cpu().numpy()
-                exr_data.raw_max = float(arr.max())
-                exr_data.raw_min = float(arr.min())
-                exr_data.raw_mean = float(arr.mean())
-                exr_data.width = arr.shape[1]
-                exr_data.height = arr.shape[0]
-            return (img, mask, img, exr_data.to_dict(), info)
+            return (img, mask, img, info)
         else:
             img, mask, info = self._load_standard(filepath)
-            exr_data = RK_EXRData()
-            exr_data.source_type = ext.lstrip('.') if ext else "image"
-            exr_data.color_space = "sRGB"
-            exr_data.filepath = filepath
-            exr_data.file_size = os.path.getsize(filepath)
-            if img.numel() > 0:
-                arr = img[0].cpu().numpy()
-                exr_data.raw_max = float(arr.max())
-                exr_data.raw_min = float(arr.min())
-                exr_data.raw_mean = float(arr.mean())
-                exr_data.width = arr.shape[1]
-                exr_data.height = arr.shape[0]
-            return (img, mask, img, exr_data.to_dict(), info)
+            return (img, mask, img, info)
 
     def _load_standard(self, filepath):
         """Load standard image formats using PIL."""
@@ -685,7 +586,7 @@ class RKAdvancedImageLoader:
             raise Exception("[RKAdvancedImageLoader] No EXR loader available. Install OpenEXR or OpenCV.")
 
     def _load_exr_dual_openexr(self, filepath):
-        """Load EXR with OpenEXR - returns (processed, mask, raw, exr_data, info)."""
+        """Load EXR with OpenEXR - returns (processed, mask, raw, info)."""
         exr_file = OpenEXR.InputFile(filepath)
         header = exr_file.header()
         
@@ -694,7 +595,7 @@ class RKAdvancedImageLoader:
         height = dw.max.y - dw.min.y + 1
         
         pt = Imath.PixelType(Imath.PixelType.FLOAT)
-        channels = list(header['channels'].keys())
+        channels = header['channels'].keys()
         
         r_str = exr_file.channel('R', pt) if 'R' in channels else None
         g_str = exr_file.channel('G', pt) if 'G' in channels else None
@@ -726,106 +627,9 @@ class RKAdvancedImageLoader:
         else:
             mask = torch.ones((1, height, width))
         
-        # Extract ALL header metadata
-        header_dict = {}
-        for key in header.keys():
-            try:
-                val = header[key]
-                # Convert to string for serialization
-                if hasattr(val, '__class__') and 'Box2i' in str(type(val)):
-                    header_dict[key] = f"({val.min.x},{val.min.y})-({val.max.x},{val.max.y})"
-                elif hasattr(val, '__class__') and 'V2f' in str(type(val)):
-                    header_dict[key] = f"({val.x},{val.y})"
-                elif hasattr(val, '__class__') and 'Compression' in str(type(val)):
-                    header_dict[key] = str(val).split('.')[-1].replace('_COMPRESSION', '')
-                elif hasattr(val, '__class__') and 'PixelType' in str(type(val)):
-                    header_dict[key] = str(val).split('.')[-1].replace('_PIXELTYPE', '')
-                elif hasattr(val, '__class__') and 'LineOrder' in str(type(val)):
-                    header_dict[key] = str(val).split('.')[-1]
-                elif hasattr(val, '__class__') and 'Chromatics' in str(type(val)):
-                    header_dict[key] = str(val)
-                elif hasattr(val, '__class__') and 'Chromaticities' in str(type(val)):
-                    header_dict[key] = str(val)
-                elif isinstance(val, (str, int, float, bool)):
-                    header_dict[key] = val
-                elif isinstance(val, bytes):
-                    header_dict[key] = val.decode('utf-8', errors='replace')[:100]
-                else:
-                    header_dict[key] = str(val)[:200]
-            except Exception as e:
-                header_dict[key] = f"<error: {str(e)[:50]}>"
-        
         exr_file.close()
         
-        # Compute pixel statistics
-        max_val = float(raw_arr.max())
-        min_val = float(raw_arr.min())
-        mean_val = float(raw_arr.mean())
-        std_val = float(raw_arr.std())
-        median_val = float(np.median(raw_arr))
-        p99_val = float(np.percentile(raw_arr, 99))
-        
-        # Detect color space type from pixel distribution
-        flat = raw_arr.flatten()
-        count_above_2 = int(np.sum(flat > 2.0))
-        count_negative = int(np.sum(flat < 0))
-        total = len(flat)
-        
-        # Heuristic detection
-        if max_val <= 1.05 and np.sum((flat >= 0) & (flat <= 1.0)) > total * 0.95:
-            detected_type = "srgb"
-            detected_cs = "sRGB"
-        elif max_val > 5.0 or count_above_2 > total * 0.05:
-            detected_type = "hdr"
-            detected_cs = "Linear HDR"
-        elif 0.5 < max_val < 5.0 and 0.1 < mean_val < 0.8 and count_above_2 < total * 0.1:
-            detected_type = "aces"
-            detected_cs = "ACES2065-1/ACEScg"
-        else:
-            detected_type = "linear"
-            detected_cs = "Linear"
-        
-        # Determine bit depth from header
-        bd = "half"
-        for ch_name in channels:
-            ch_info = header['channels'][ch_name]
-            if hasattr(ch_info, 'type'):
-                pt_name = str(ch_info.type)
-                if 'FLOAT' in pt_name:
-                    bd = "float"
-                    break
-                elif 'HALF' in pt_name:
-                    bd = "half"
-                    break
-        
-        # Determine compression from header
-        comp = "zip"
-        if 'compression' in header:
-            comp_str = str(header['compression'])
-            for c in ['NONE', 'RLE', 'ZIPS', 'ZIP', 'PIZ', 'PXR24', 'B44', 'B44A', 'DWAA', 'DWAB']:
-                if c in comp_str:
-                    comp = c.lower().replace('_compression', '')
-                    break
-        
-        # Build EXR data
-        exr_data = RK_EXRData()
-        exr_data.source_type = "exr"
-        exr_data.filepath = filepath
-        exr_data.file_size = os.path.getsize(filepath)
-        exr_data.raw_max = max_val
-        exr_data.raw_min = min_val
-        exr_data.raw_mean = mean_val
-        exr_data.raw_median = median_val
-        exr_data.raw_p99 = p99_val
-        exr_data.raw_std = std_val
-        exr_data.width = width
-        exr_data.height = height
-        exr_data.channels = 3 + (1 if a_str is not None else 0)
-        exr_data.has_alpha = a_str is not None
-        exr_data.bit_depth = bd
-        exr_data.compression = comp
-        exr_data.color_space = detected_cs
-        exr_data.exr_header = header_dict
+        max_val = raw_arr.max()
         
         # PROCESSED: tonemapped for display [0-1]
         processed_arr = raw_arr.copy()
@@ -838,11 +642,11 @@ class RKAdvancedImageLoader:
         raw_clamped = np.clip(raw_arr, 0, 65504.0)
         raw_tensor = torch.from_numpy(raw_clamped.astype(np.float32)).unsqueeze(0)
         
-        info = f"EXR | {width}x{height} | Max:{max_val:.4f} | {detected_cs} | {bd} | {comp} | Ch:{exr_data.channels}"
-        return (processed_tensor, mask, raw_tensor, exr_data.to_dict(), info)
+        info = f"{os.path.basename(filepath)} | {width}x{height} | EXR | Max: {max_val:.4f}"
+        return (processed_tensor, mask, raw_tensor, info)
 
     def _load_exr_dual_cv2(self, filepath):
-        """Load EXR with cv2 - returns (processed, mask, raw, exr_data, info)."""
+        """Load EXR with cv2 - returns (processed, mask, raw, info)."""
         img = cv2.imread(filepath, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
         
         if img is None:
@@ -861,40 +665,7 @@ class RKAdvancedImageLoader:
             img = np.stack([img] * 3, axis=-1)
         
         raw_arr = img.copy()
-        max_val = float(raw_arr.max())
-        min_val = float(raw_arr.min())
-        mean_val = float(raw_arr.mean())
-        std_val = float(raw_arr.std())
-        median_val = float(np.median(raw_arr))
-        p99_val = float(np.percentile(raw_arr, 99))
-        
-        # Simple detection for cv2 path
-        is_aces = (0.5 < max_val < 5.0 and 0.1 < mean_val < 0.8)
-        if is_aces:
-            detected_cs = "ACES2065-1/ACEScg"
-        elif max_val <= 1.05:
-            detected_cs = "sRGB"
-        elif max_val > 5.0:
-            detected_cs = "Linear HDR"
-        else:
-            detected_cs = "Linear"
-        
-        h, w = raw_arr.shape[:2]
-        
-        exr_data = RK_EXRData()
-        exr_data.source_type = "exr"
-        exr_data.filepath = filepath
-        exr_data.file_size = os.path.getsize(filepath)
-        exr_data.raw_max = max_val
-        exr_data.raw_min = min_val
-        exr_data.raw_mean = mean_val
-        exr_data.raw_median = median_val
-        exr_data.raw_p99 = p99_val
-        exr_data.raw_std = std_val
-        exr_data.width = w
-        exr_data.height = h
-        exr_data.bit_depth = "half"
-        exr_data.color_space = detected_cs
+        max_val = raw_arr.max()
         
         # PROCESSED: tonemapped
         processed_arr = raw_arr.copy()
@@ -907,10 +678,11 @@ class RKAdvancedImageLoader:
         raw_clamped = np.clip(raw_arr, 0, 65504.0)
         raw_tensor = torch.from_numpy(raw_clamped).unsqueeze(0)
         
+        h, w = raw_arr.shape[:2]
         mask = torch.ones((1, h, w))
         
-        info = f"EXR(cv2) | {w}x{h} | Max:{max_val:.4f} | {detected_cs}"
-        return (processed_tensor, mask, raw_tensor, exr_data.to_dict(), info)
+        info = f"{os.path.basename(filepath)} | {w}x{h} | EXR (cv2) | Max: {max_val:.4f}"
+        return (processed_tensor, mask, raw_tensor, info)
 
     def _load_hdr(self, filepath):
         """Load HDR/Radiance format."""
@@ -986,29 +758,26 @@ class RK_EXRConverter:
                 "exposure": ("FLOAT", {"default": 0.0, "min": -10.0, "max": 10.0, "step": 0.01, "tooltip": "Exposure adjustment in stops"}),
                 "tone_map": (["none", "reinhard", "aces", "filmic", "agx"], {"default": "aces", "tooltip": "Tone mapping algorithm"}),
                 "output_depth": (["8bit", "16bit", "32bit"], {"default": "16bit", "tooltip": "Output bit depth for PNG"}),
-                "preserve_exr": ("BOOLEAN", {"default": True, "tooltip": "ON=use only reversible ops (linear scale) for perfect EXR round-trip. OFF=full tone mapping for best display quality."}),
                 "auto_save_png": ("BOOLEAN", {"default": False, "tooltip": "Automatically save converted PNG to output folder"}),
                 "filename_prefix": ("STRING", {"default": "exr_converted", "tooltip": "Prefix for saved PNG filename"}),
             },
             "optional": {
                 "custom_lut": (sorted(lut_files), {"tooltip": "3D LUT .cube file (place in input/luts/ folder)"}),
-                "exr_data": ("DICT", {"tooltip": "Connect exr_data from Advanced Image Loader to preserve metadata through the pipeline"}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "DICT", "STRING", "STRING")
-    RETURN_NAMES = ("converted_image", "exr_data", "info", "saved_path")
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("converted_image", "info", "saved_path")
     CATEGORY = "rk_pix/image"
     FUNCTION = "convert_exr"
     OUTPUT_NODE = True
 
     def convert_exr(self, raw_exr, enable, color_space, gamma, exposure, tone_map,
-                    output_depth, preserve_exr, auto_save_png, filename_prefix, custom_lut="None", exr_data=None):
+                    output_depth, auto_save_png, filename_prefix, custom_lut="None"):
         
         if not enable:
             dummy = torch.zeros((1, 64, 64, 3))
-            empty_data = RK_EXRData().to_dict()
-            return (dummy, empty_data, "[DISABLED]", "")
+            return (dummy, "[DISABLED]", "")
 
         if raw_exr is None or raw_exr.shape[0] == 0:
             raise Exception("[RK_EXRConverter] No raw EXR input connected. Connect raw_exr from Advanced Image Loader.")
@@ -1016,77 +785,41 @@ class RK_EXRConverter:
         # raw_exr is a torch tensor [B, H, W, 3] with float values (may be > 1)
         img_arr = raw_exr[0].cpu().numpy().astype(np.float32)  # Take first batch item
         h, w = img_arr.shape[:2]
-        raw_max_val = img_arr.max()
+        max_val = img_arr.max()
         
-        # === PRESERVE EXR MODE: Only reversible operations ===
-        if preserve_exr:
-            # Apply exposure (reversible: just multiply/divide)
-            if exposure != 0:
-                img_arr = img_arr * (2.0 ** exposure)
-            
-            # Linear scale to [0,1] - perfectly reversible!
-            # Just divide by max, so Image To EXR can multiply back
-            current_max = img_arr.max()
-            if current_max > 1.0:
-                img_arr = img_arr / current_max
-            
-            # Skip tone mapping and color space - keep linear
-            # This ensures perfect round-trip back to EXR
-            tone_map_used = "linear_scale (preserve)"
-            color_space_used = "linear (preserve)"
-            
-            # No dithering needed for 32-bit float output
-            if output_depth == "32bit":
-                out_arr = img_arr.astype(np.float32)
-                depth_info = "32-bit float (preserve)"
-            else:
-                # For 8/16 bit, still use dithering for display quality
-                img_arr = np.clip(img_arr, 0, 1)
-                img_arr = self._apply_dithering(img_arr, output_depth)
-                if output_depth == "8bit":
-                    out_arr = (img_arr * 255.0).astype(np.uint8)
-                    depth_info = "8-bit"
-                else:
-                    out_arr = (img_arr * 65535.0).astype(np.uint16)
-                    depth_info = "16-bit"
+        # Apply exposure
+        if exposure != 0:
+            img_arr = img_arr * (2.0 ** exposure)
         
-        # === DISPLAY MODE: Full tone mapping + color space ===
-        else:
-            # Apply exposure
-            if exposure != 0:
-                img_arr = img_arr * (2.0 ** exposure)
-            
-            # Apply tone mapping
-            img_arr = self._apply_tone_map(img_arr, tone_map)
-            
-            # Apply color space transform
-            input_dir = folder_paths.get_input_directory()
-            img_arr = self._apply_color_space(img_arr, color_space, gamma, custom_lut, input_dir)
-            
-            # Clip to valid range
-            img_arr = np.clip(img_arr, 0, 1)
-            
-            # Apply dithering to reduce banding
-            img_arr = self._apply_dithering(img_arr, output_depth)
-            
-            tone_map_used = tone_map
-            color_space_used = color_space
-            
-            # Convert to output bit depth
-            if output_depth == "8bit":
-                out_arr = (img_arr * 255.0).astype(np.uint8)
-                depth_info = "8-bit"
-            elif output_depth == "16bit":
-                out_arr = (img_arr * 65535.0).astype(np.uint16)
-                depth_info = "16-bit"
-            else:  # 32bit
-                out_arr = img_arr.astype(np.float32)
-                depth_info = "32-bit float"
+        # Apply tone mapping
+        img_arr = self._apply_tone_map(img_arr, tone_map)
         
-        # Create tensor from output array
+        # Apply color space transform
+        input_dir = folder_paths.get_input_directory()
+        img_arr = self._apply_color_space(img_arr, color_space, gamma, custom_lut, input_dir)
+        
+        # Clip to valid range
+        img_arr = np.clip(img_arr, 0, 1)
+        
+        # Apply dithering to reduce banding
+        img_arr = self._apply_dithering(img_arr, output_depth)
+        
+        # Convert to output bit depth
+        if output_depth == "8bit":
+            out_arr = (img_arr * 255.0).astype(np.uint8)
+            depth_info = "8-bit"
+        elif output_depth == "16bit":
+            out_arr = (img_arr * 65535.0).astype(np.uint16)
+            depth_info = "16-bit"
+        else:  # 32bit - keep float precision
+            out_arr = img_arr.astype(np.float32)
+            depth_info = "32-bit float"
+        
+        # Create tensor from the dithered/quantized array for maximum quality
         if output_depth == "32bit":
             tensor = torch.from_numpy(img_arr.astype(np.float32)).unsqueeze(0)
         else:
+            # For 8/16 bit, convert back through float to preserve the dithering
             tensor = torch.from_numpy(out_arr.astype(np.float32) / (255.0 if output_depth == "8bit" else 65535.0)).unsqueeze(0)
         
         # Auto-save if enabled
@@ -1103,6 +836,7 @@ class RK_EXRConverter:
             
             # Save with PIL
             if output_depth == "32bit":
+                # For 32-bit, save as 16-bit since most viewers don't support 32-bit PNG well
                 save_arr = (img_arr * 65535.0).astype(np.uint16)
                 pil_img = Image.fromarray(save_arr, mode='RGB')
             else:
@@ -1114,27 +848,11 @@ class RK_EXRConverter:
             pil_img.save(save_path)
             saved_path = save_path
         
-        # Pass through exr_data with processing info
-        if exr_data is not None and isinstance(exr_data, dict):
-            out_exr_data = RK_EXRData.from_dict(exr_data)
-        else:
-            out_exr_data = RK_EXRData()
-            out_exr_data.raw_max = float(raw_max_val)
-            out_exr_data.width = w
-            out_exr_data.height = h
-        
-        # Record what was done
-        out_exr_data.processed_tone_map = tone_map_used
-        out_exr_data.processed_color_space = color_space_used
-        out_exr_data.processed_exposure = float(exposure)
-        out_exr_data.preserve_exr = preserve_exr
-        
-        mode_str = "PRESERVE" if preserve_exr else "DISPLAY"
-        info = f"EXR Convert [{mode_str}] | {w}x{h} | RawMax: {out_exr_data.raw_max:.4f} | {tone_map_used} | {color_space_used} | {depth_info}"
+        info = f"EXR Convert | {w}x{h} | Max: {max_val:.4f} | {tone_map} tone map | {color_space} | {depth_info}"
         if saved_path:
             info += f" | Saved: {os.path.basename(saved_path)}"
         
-        return (tensor, out_exr_data.to_dict(), info, saved_path)
+        return (tensor, info, saved_path)
 
     def _apply_tone_map(self, img_arr, tone_map):
         """Apply tone mapping to HDR image."""
@@ -1312,7 +1030,7 @@ class RK_EXRConverter:
 
     @classmethod
     def IS_CHANGED(cls, raw_exr, enable, color_space, gamma, exposure, tone_map,
-                   output_depth, preserve_exr, auto_save_png, filename_prefix, custom_lut="None"):
+                   output_depth, auto_save_png, filename_prefix, custom_lut="None"):
         if not enable:
             return ""
         # For IMAGE input, use a hash of the tensor
@@ -1361,8 +1079,7 @@ class RKImageToEXR:
                 "auto_increment": ("BOOLEAN", {"default": True, "tooltip": "Auto-number if file exists"}),
             },
             "optional": {
-                "reference_exr": ("IMAGE", {"tooltip": "Fallback: Connect original raw EXR here. Use exr_data from EXR Converter for perfect reconstruction."}),
-                "exr_data": ("DICT", {"tooltip": "CRITICAL: Connect exr_data from EXR Converter for perfect lossless reconstruction. This knows exactly what transforms were applied."}),
+                "reference_exr": ("IMAGE", {"tooltip": "CRITICAL: Connect original raw EXR here to copy its data characteristics (range, gamma, linearity, color space)"}),
             },
         }
 
@@ -1372,7 +1089,7 @@ class RKImageToEXR:
     FUNCTION = "convert_to_exr"
     OUTPUT_NODE = True
 
-    def convert_to_exr(self, image, enable, save_exr, save_path, filename, auto_increment, reference_exr=None, exr_data=None):
+    def convert_to_exr(self, image, enable, save_exr, save_path, filename, auto_increment, reference_exr=None):
         
         if not enable:
             dummy = torch.zeros((1, 64, 64, 3))
@@ -1408,73 +1125,50 @@ class RKImageToEXR:
             original_preview_arr = np.clip(original_preview_arr, 0, 1)
             original_preview = torch.from_numpy(original_preview_arr.astype(np.float32)).unsqueeze(0)
             
-            # === UNIVERSAL RANGE MATCHING ALGORITHM ===
-            # Core principle: We don't try to reverse tone mapping (it's lossy).
-            # Instead, we scale the processed image to match the original raw data range.
-            # This works for ALL EXR types universally.
+            # Analyze reference EXR if provided
+            ref_analysis = None
+            if reference_exr is not None and reference_exr.shape[0] > 0:
+                ref_analysis = self._analyze_reference(reference_exr)
             
-            # Step 1: Normalize input to [0,1] range
-            current_max = img_arr.max()
-            if current_max > 1.0:
-                if current_max <= 255.0:
+            # === PROCESS IMAGE FOR EXR CONVERSION ===
+            
+            # Step 1: Normalize input to [0,1]
+            max_val = img_arr.max()
+            if max_val > 1.0:
+                if max_val <= 255.0:
                     img_arr = img_arr / 255.0
                 else:
                     img_arr = img_arr / 65535.0
-                current_max = img_arr.max()
             
-            # Step 2: Get target range from exr_data or reference
-            target_max = 1.0
-            target_min = 0.0
-            bit_depth = "half"
-            compression = "zip"
-            source_info = "default"
-            preserve_mode = False
-            
-            if exr_data is not None and isinstance(exr_data, dict):
-                # Use metadata pipeline - BEST METHOD
-                target_max = exr_data.get('raw_max', 1.0)
-                target_min = exr_data.get('raw_min', 0.0)
-                bit_depth = exr_data.get('bit_depth', 'half')
-                compression = exr_data.get('compression', 'zip')
-                preserve_mode = exr_data.get('preserve_exr', False)
-                source_info = f"exr_data ({exr_data.get('source_type', 'unknown')})"
+            # Step 2: Apply reference-based transformations
+            if ref_analysis is not None:
+                ref_type = ref_analysis.get('type', 'unknown')
+                ref_max = ref_analysis.get('max_val', 1.0)
                 
-            elif reference_exr is not None and reference_exr.shape[0] > 0:
-                # Fallback: analyze reference pixels
-                ref = reference_exr[0] if len(reference_exr.shape) == 4 else reference_exr
-                ref_arr = np.array(ref.cpu().numpy(), dtype=np.float32, copy=True)
-                target_max = float(ref_arr.max())
-                target_min = float(ref_arr.min())
-                source_info = "reference_exr"
-            
-            # Step 3: Scale to match original range
-            # When preserve_exr was used, the converter did linear scaling (divide by max)
-            # So we just multiply by original_max - PERFECT reversal!
-            if preserve_mode:
-                # PERFECT round-trip: linear scale was used in converter
-                # img_converter = raw / raw_max
-                # So: raw = img_converter * raw_max
-                scale = target_max / max(current_max, 1e-6)
-                img_arr = img_arr * scale
-                source_info += " | PERFECT (linear_scale)"
-            else:
-                # DISPLAY mode: non-linear tone mapping was used
-                # We can only approximate by matching the range
-                if current_max > 1e-6 and target_max > current_max:
-                    scale = target_max / current_max
+                # ALWAYS reverse sRGB if the processed image is in sRGB space
+                # The input image from EXR Converter is typically sRGB-encoded
+                # We need to get back to linear before scaling to HDR range
+                img_arr = self._reverse_srgb(img_arr)
+                
+                # Scale to match reference data range
+                if ref_max > 1.0:
+                    current_max = max(img_arr.max(), 1e-6)
+                    scale = ref_max / current_max
                     img_arr = img_arr * scale
-                    source_info += " | APPROX (tone_mapped)"
-                elif target_max <= 1.0 and current_max > 1.0:
-                    img_arr = np.clip(img_arr, 0, target_max)
+                elif ref_max > 0.5:
+                    # Reference max is around 0.5-1.0, likely already normalized
+                    # Just ensure we don't lose the range
+                    pass
+                
+                bit_depth = ref_analysis.get('bit_depth', 'half')
+                compression = ref_analysis.get('compression', 'zip')
+            else:
+                # No reference - assume input is sRGB, convert to linear
+                img_arr = self._reverse_srgb(img_arr)
+                bit_depth = 'half'
+                compression = 'zip'
             
-            # Handle negative values if original had them
-            if target_min < 0:
-                current_min = img_arr.min()
-                if current_min > target_min:
-                    shift = target_min - current_min
-                    img_arr = img_arr + shift
-            
-            # Step 4: Build channels for EXR
+            # Step 3: Build channels for EXR
             if c >= 3:
                 channels = {
                     'R': np.array(img_arr[:, :, 0], copy=True),
@@ -1487,7 +1181,7 @@ class RKImageToEXR:
                 gray = np.array(img_arr[:, :, 0], copy=True)
                 channels = {'R': gray, 'G': gray.copy(), 'B': gray.copy()}
             
-            # Step 5: Save EXR if enabled
+            # Step 4: Save EXR if enabled
             saved_name = ""
             if save_exr:
                 output_dir = self._get_output_dir(save_path)
@@ -1501,12 +1195,12 @@ class RKImageToEXR:
                     raise Exception("No EXR writer available. Install OpenEXR or OpenCV.")
                 saved_name = fname
             
-            # Step 6: Create EXR preview with proper HDR tonemapping
+            # Step 5: Create EXR preview with proper HDR tonemapping
             exr_preview_arr = self._tonemap_for_preview(img_arr)
             exr_preview = torch.from_numpy(exr_preview_arr.astype(np.float32)).unsqueeze(0)
             
             # Build detailed info
-            info = self._build_info_v3(w, h, exr_data, target_max, current_max, saved_name, source_info)
+            info = self._build_info(w, h, ref_analysis, bit_depth, saved_name)
             
             return (original_preview, exr_preview, info)
             
@@ -1605,117 +1299,13 @@ class RKImageToEXR:
         analysis['compression'] = 'zip'
         return analysis
 
-    def _reverse_from_exr_data(self, img_arr, exr_data):
-        """
-        Perfect reconstruction using metadata from EXR Converter.
-        Reverses each transformation that was applied, in reverse order.
-        """
-        data = RK_EXRData.from_dict(exr_data)
-        
-        # Get original characteristics
-        orig_max = data.max_val
-        orig_color_space = data.color_space
-        bit_depth = data.bit_depth
-        compression = data.compression
-        
-        # Step 1: Reverse color space transform (last applied in converter)
-        applied_cs = data.applied_color_space
-        if applied_cs == "srgb":
-            # Image is sRGB encoded → reverse to linear
-            img_arr = self._reverse_srgb(img_arr)
-        elif applied_cs == "rec709":
-            # Reverse Rec.709
-            img_arr = self._reverse_rec709(img_arr)
-        elif applied_cs == "aces":
-            # ACES tone map was applied as color space - this is display-referred
-            # We can't perfectly reverse it, but we can approximate
-            img_arr = self._reverse_aces_tone(img_arr)
-        elif applied_cs == "custom_gamma":
-            # Reverse custom gamma
-            gamma = data.applied_gamma
-            if gamma > 0:
-                img_arr = img_arr ** gamma
-        elif applied_cs == "linear":
-            # No color space transform, already linear
-            pass
-        # custom_lut can't be perfectly reversed
-        
-        # Step 2: Reverse tone mapping (applied before color space in converter)
-        applied_tm = data.applied_tone_map
-        if applied_tm == "reinhard":
-            # Reinhard: y = x / (1+x) → reverse: x = y / (1-y)
-            img_arr = np.clip(img_arr, 0, 0.9999)
-            img_arr = img_arr / (1.0 - img_arr)
-        elif applied_tm == "aces":
-            # ACES tone map is non-linear, approximate reverse
-            img_arr = self._reverse_aces_tone(img_arr)
-        elif applied_tm == "filmic":
-            # Filmic is complex, approximate with inverse Reinhard
-            img_arr = np.clip(img_arr, 0, 0.9999)
-            img_arr = img_arr / (1.0 - img_arr)
-        elif applied_tm == "agx":
-            # AgX: y = x / (x + 0.5) → reverse: x = 0.5*y / (1-y)
-            img_arr = np.clip(img_arr, 0, 0.9999)
-            img_arr = 0.5 * img_arr / (1.0 - img_arr)
-        elif applied_tm == "none":
-            pass
-        
-        # Step 3: Reverse exposure
-        exposure = data.applied_exposure
-        if exposure != 0:
-            img_arr = img_arr / (2.0 ** exposure)
-        
-        # Step 4: Scale to original range
-        if orig_max > 1.0:
-            current_max = max(img_arr.max(), 1e-6)
-            scale = orig_max / current_max
-            img_arr = img_arr * scale
-        
-        return img_arr, bit_depth, compression, "exr_data pipeline"
-
-    def _reverse_from_reference(self, img_arr, ref_analysis):
-        """Fallback: Reverse using reference EXR pixel analysis."""
-        ref_max = ref_analysis.get('max_val', 1.0)
-        
-        # Reverse sRGB (assume processed image is sRGB)
-        img_arr = self._reverse_srgb(img_arr)
-        
-        # Scale to match reference data range
-        if ref_max > 1.0:
-            current_max = max(img_arr.max(), 1e-6)
-            scale = ref_max / current_max
-            img_arr = img_arr * scale
-        
-        bit_depth = ref_analysis.get('bit_depth', 'half')
-        compression = ref_analysis.get('compression', 'zip')
-        
-        return img_arr, bit_depth, compression, "reference analysis"
-
     def _reverse_srgb(self, img_arr):
         """Reverse sRGB gamma to get linear values."""
+        # Protect against out-of-range values
         img_arr = np.clip(img_arr, 0, 1)
         mask = img_arr <= 0.04045
         linear = np.where(mask, img_arr / 12.92, ((img_arr + 0.055) / 1.055) ** 2.4)
         return linear
-
-    def _reverse_rec709(self, img_arr):
-        """Reverse Rec.709 gamma to linear."""
-        img_arr = np.clip(img_arr, 0, 1)
-        mask = img_arr <= 0.081
-        linear = np.where(mask, img_arr / 4.5, ((img_arr + 0.099) / 1.099) ** (1/0.45))
-        return linear
-
-    def _reverse_aces_tone(self, img_arr):
-        """Approximate reverse of ACES tone mapping."""
-        # ACES tone map compresses highlights
-        # Approximate inverse: expand highlights
-        img_arr = np.clip(img_arr, 0, 1)
-        # Simple approximation: for values > 0.5, expand more aggressively
-        mask = img_arr > 0.5
-        expanded = np.where(mask, 
-                           0.5 + (img_arr - 0.5) * 3.0,  # Expand highlights
-                           img_arr * 2.0)  # Expand shadows less
-        return np.clip(expanded, 0, 65504.0)
 
     def _tonemap_for_preview(self, img_arr):
         """Proper HDR to LDR tonemapping for preview."""
@@ -1732,28 +1322,20 @@ class RKImageToEXR:
         
         return preview.astype(np.float32)
 
-    def _build_info_v3(self, w, h, exr_data, target_max, current_max, saved_name, source_info):
+    def _build_info(self, w, h, ref_analysis, bit_depth, saved_name):
         """Build detailed info string."""
         info_parts = [f"ImageToEXR | {w}x{h}"]
-        info_parts.append(f"Source: {source_info}")
         
-        if exr_data is not None and isinstance(exr_data, dict):
-            info_parts.append(f"Type: {exr_data.get('source_type', 'unknown').upper()}")
-            info_parts.append(f"ColorSpace: {exr_data.get('color_space', 'Unknown')}")
-            info_parts.append(f"RawRange: {exr_data.get('raw_min', 0):.4f} - {exr_data.get('raw_max', 1):.4f}")
-            info_parts.append(f"RawMean: {exr_data.get('raw_mean', 0):.4f} | Median: {exr_data.get('raw_median', 0):.4f}")
-            info_parts.append(f"P99: {exr_data.get('raw_p99', 0):.4f} | Std: {exr_data.get('raw_std', 0):.4f}")
-            info_parts.append(f"Scale: {current_max:.4f} -> {target_max:.4f} (x{target_max/max(current_max,1e-6):.2f})")
-            info_parts.append(f"Depth: {exr_data.get('bit_depth', 'half')} | Comp: {exr_data.get('compression', 'zip')}")
-            if exr_data.get('processed_tone_map'):
-                info_parts.append(f"Proc: {exr_data.get('processed_tone_map', 'none')} TM")
-            # Show header keys if available
-            header = exr_data.get('exr_header', {})
-            if header:
-                key_list = list(header.keys())[:5]
-                info_parts.append(f"Header: {', '.join(key_list)}{'...' if len(header) > 5 else ''}")
+        if ref_analysis:
+            info_parts.append(f"Type: {ref_analysis.get('type', 'unknown').upper()}")
+            info_parts.append(f"ColorSpace: {ref_analysis.get('color_space', 'Unknown')}")
+            info_parts.append(f"Range: {ref_analysis.get('min_val', 0):.4f} - {ref_analysis.get('max_val', 1):.4f}")
+            info_parts.append(f"Mean: {ref_analysis.get('mean', 0):.4f} | Std: {ref_analysis.get('std', 0):.4f}")
+            info_parts.append(f"Median: {ref_analysis.get('median', 0):.4f} | P99: {ref_analysis.get('p99', 0):.4f}")
+            info_parts.append(f"Distribution: {ref_analysis.get('pct_0_1', 0):.1f}% in [0,1], {ref_analysis.get('pct_above_2', 0):.1f}% >2")
+            info_parts.append(f"Depth: {bit_depth} | sRGB: {ref_analysis.get('is_srgb', False)}")
         else:
-            info_parts.append(f"TargetMax: {target_max:.4f} | CurrentMax: {current_max:.4f}")
+            info_parts.append("No reference - using defaults (linear, half)")
         
         if saved_name:
             info_parts.append(f"Saved: {saved_name}")
@@ -1853,197 +1435,6 @@ class RKImageToEXR:
 
 
 # ============================================================
-# SAVE EXR NODE - Simple direct EXR saver
-# ============================================================
-
-class RKSaveEXR:
-    """
-    Save any IMAGE tensor directly as an EXR file.
-    
-    Features:
-    - Takes IMAGE input (can be any float tensor, values may exceed 1.0)
-    - Saves as proper OpenEXR format
-    - Configurable bit depth (half/float)
-    - Configurable compression
-    - Custom save path and filename
-    - Auto-increment filename to avoid overwriting
-    - Returns saved path for confirmation
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE", {"tooltip": "Image tensor to save as EXR. Can be HDR (values > 1.0)."}),
-                "save_path": ("STRING", {"default": "", "tooltip": "Folder path to save EXR. Empty=ComfyUI output folder."}),
-                "filename": ("STRING", {"default": "output", "tooltip": "Filename without .exr extension"}),
-                "bit_depth": (["half", "float"], {"default": "half", "tooltip": "EXR bit depth: half=16-bit float, float=32-bit float"}),
-                "compression": (["none", "rle", "zips", "zip", "piz", "pxr24", "b44", "b44a", "dwaa", "dwab"], {"default": "zip", "tooltip": "EXR compression method"}),
-                "auto_increment": ("BOOLEAN", {"default": True, "tooltip": "Auto-number if file exists"}),
-            },
-            "optional": {
-                "exr_data": ("DICT", {"tooltip": "Optional: Connect exr_data to copy bit_depth and compression from original"}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("saved_path", "info")
-    CATEGORY = "rk_pix/image"
-    FUNCTION = "save_exr"
-    OUTPUT_NODE = True
-
-    def save_exr(self, image, save_path, filename, bit_depth, compression, auto_increment, exr_data=None):
-        """
-        Save IMAGE tensor as EXR file.
-        If exr_data is provided, copies bit_depth, compression, and color_space from original.
-        """
-        if image is None or image.shape[0] == 0:
-            return ("", "[ERROR] No image input")
-
-        try:
-            # Get input image data
-            if len(image.shape) == 4:
-                img_tensor = image[0]
-            else:
-                img_tensor = image
-            
-            h, w, c = img_tensor.shape
-            img_arr = np.array(img_tensor.cpu().numpy(), dtype=np.float32, copy=True)
-            
-            # Use exr_data settings if provided (from Advanced Image Loader)
-            source_info = "manual"
-            color_space = "unknown"
-            if exr_data is not None and isinstance(exr_data, dict):
-                bit_depth = exr_data.get('bit_depth', bit_depth)
-                compression = exr_data.get('compression', compression)
-                color_space = exr_data.get('color_space', 'unknown')
-                source_info = f"from_{exr_data.get('source_type', 'unknown')}"
-            
-            # Build channels
-            if c >= 3:
-                channels = {
-                    'R': np.array(img_arr[:, :, 0], copy=True),
-                    'G': np.array(img_arr[:, :, 1], copy=True),
-                    'B': np.array(img_arr[:, :, 2], copy=True)
-                }
-                if c >= 4:
-                    channels['A'] = np.array(img_arr[:, :, 3], copy=True)
-            else:
-                gray = np.array(img_arr[:, :, 0], copy=True)
-                channels = {'R': gray, 'G': gray.copy(), 'B': gray.copy()}
-            
-            # Build output path
-            output_dir = self._get_output_dir(save_path)
-            exr_path, fname = self._build_filename(output_dir, filename, auto_increment)
-            
-            # Save EXR
-            if OPENEXR_AVAILABLE:
-                self._save_exr_openexr(exr_path, channels, h, w, bit_depth, compression)
-            elif CV2_AVAILABLE:
-                self._save_exr_cv2(exr_path, img_arr)
-            else:
-                return ("", "[ERROR] No EXR writer available. Install OpenEXR or OpenCV.")
-            
-            # Build info
-            max_val = img_arr.max()
-            min_val = img_arr.min()
-            mean_val = img_arr.mean()
-            info = f"SaveEXR | {w}x{h} | {c}ch | Range: {min_val:.4f} - {max_val:.4f} | Mean: {mean_val:.4f} | {bit_depth} | {compression} | CS: {color_space} | Source: {source_info} | Saved: {fname}"
-            
-            return (exr_path, info)
-            
-        except Exception as e:
-            return ("", f"[ERROR] {str(e)}")
-
-    def _get_output_dir(self, save_path):
-        """Determine output directory."""
-        if save_path and save_path.strip():
-            output_dir = os.path.normpath(save_path.strip())
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir, exist_ok=True)
-            return output_dir
-        return folder_paths.get_output_directory()
-
-    def _build_filename(self, output_dir, filename, auto_increment):
-        """Build unique filename."""
-        base_name = filename.strip() if filename and filename.strip() else "output"
-        
-        if auto_increment:
-            counter = 1
-            while True:
-                fname = f"{base_name}_{counter:04d}.exr"
-                exr_path = os.path.join(output_dir, fname)
-                if not os.path.exists(exr_path):
-                    break
-                counter += 1
-        else:
-            fname = f"{base_name}.exr"
-            exr_path = os.path.join(output_dir, fname)
-        
-        return exr_path, fname
-
-    def _save_exr_openexr(self, filepath, channels, h, w, bit_depth, compression):
-        """Save EXR using OpenEXR library."""
-        import Imath
-        
-        compression_map = {
-            "none": Imath.Compression.NO_COMPRESSION,
-            "rle": Imath.Compression.RLE_COMPRESSION,
-            "zips": Imath.Compression.ZIPS_COMPRESSION,
-            "zip": Imath.Compression.ZIP_COMPRESSION,
-            "piz": Imath.Compression.PIZ_COMPRESSION,
-            "pxr24": Imath.Compression.PXR24_COMPRESSION,
-            "b44": Imath.Compression.B44_COMPRESSION,
-            "b44a": Imath.Compression.B44A_COMPRESSION,
-            "dwaa": Imath.Compression.DWAA_COMPRESSION,
-            "dwab": Imath.Compression.DWAB_COMPRESSION,
-        }
-        
-        comp = compression_map.get(compression, Imath.Compression.ZIP_COMPRESSION)
-        
-        if bit_depth == "half":
-            pt = Imath.PixelType(Imath.PixelType.HALF)
-        else:
-            pt = Imath.PixelType(Imath.PixelType.FLOAT)
-        
-        header = OpenEXR.Header(w, h)
-        header['compression'] = comp
-        header['channels'] = {name: pt for name in channels.keys()}
-        
-        channel_data = {}
-        for name, arr in channels.items():
-            if bit_depth == "half":
-                flat = arr.astype(np.float16).flatten()
-                channel_data[name] = flat.tobytes()
-            else:
-                channel_data[name] = arr.astype(np.float32).tobytes()
-        
-        exr_out = OpenEXR.OutputFile(filepath, header)
-        exr_out.writePixels(channel_data)
-        exr_out.close()
-
-    def _save_exr_cv2(self, filepath, img_arr):
-        """Save EXR using OpenCV fallback."""
-        if len(img_arr.shape) == 3 and img_arr.shape[2] >= 3:
-            bgr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
-        else:
-            bgr = img_arr
-        cv2.imwrite(filepath, bgr.astype(np.float32))
-
-    @classmethod
-    def IS_CHANGED(cls, image, save_path, filename, bit_depth, compression, auto_increment, exr_data=None):
-        if image is not None:
-            try:
-                img_bytes = image.cpu().numpy().tobytes()
-                m = hashlib.sha256()
-                m.update(img_bytes)
-                return m.digest().hex()
-            except:
-                pass
-        return float("NaN")
-
-
-# ============================================================
 # REGISTRATION
 # ============================================================
 
@@ -2057,7 +1448,6 @@ IMAGE_CLASS_MAPPINGS = {
     "RKAdvancedImageLoader": RKAdvancedImageLoader,
     "RK_EXRConverter": RK_EXRConverter,
     "RKImageToEXR": RKImageToEXR,
-    "RKSaveEXR": RKSaveEXR,
 }
 
 IMAGE_NAME_MAPPINGS = {
@@ -2070,5 +1460,4 @@ IMAGE_NAME_MAPPINGS = {
     "RKAdvancedImageLoader": "Advanced Image Loader (RK)",
     "RK_EXRConverter": "EXR Converter (RK)",
     "RKImageToEXR": "Image To EXR (RK)",
-    "RKSaveEXR": "Save EXR (RK)",
 }
